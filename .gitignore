@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+
+data/
+doc/
+outputs/
+checkpoints/
+*.mat
+*.npy
+*.npz
+*.pth
+*.pt
+*.ckpt
+
+.env
+.venv/
+venv/
