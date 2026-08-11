@@ -1,17 +1,71 @@
+# Python bytecode and tool caches
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
 
+# Private datasets and generated artifacts
 data/
 doc/
 outputs/
 checkpoints/
+logs/
+wandb/
+mlruns/
 *.mat
 *.npy
 *.npz
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.parquet
+*.feather
+*.jsonl
+*.sqlite
+*.sqlite3
+*.db
 *.pth
 *.pt
 *.ckpt
+*.onnx
+*.log
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.zip
+*.7z
+*.rar
 
+# LLC-PC local-only files
+baselines/llc_pc/configs/*.local.json
+baselines/llc_pc/tc_maps/
+baselines/llc_pc/raw_contexts/
+baselines/llc_pc/encoded_contexts/
+baselines/llc_pc/external/
+baselines/llc_pc/vendor/
+
+# Secrets and local environments
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
 .venv/
 venv/
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini

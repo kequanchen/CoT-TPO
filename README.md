@@ -1,27 +1,39 @@
 # CoT-TP Public Code
 
-This repository contains the paper-aligned implementation of the CoT-TP
-pipeline. The released code covers the proposed method: LLM teacher reasoning,
-strategy-vector parsing, MLP student distillation, and FiLM-conditioned
-trajectory prediction.
+This repository contains the paper-aligned implementation of CoT-TP. The core
+pipeline covers LLM teacher reasoning, strategy-vector parsing, MLP student
+distillation, and FiLM-conditioned trajectory prediction. It also contains the
+independently implemented **LLC-PC** baseline adapted to the post-crash
+lane-changing data format used in the study.
 
 ## Repository Structure
 
 ```text
 .
-├── scripts/
-│   ├── generate_llm_teacher.py
-│   ├── parse_strategy_vectors.py
-│   ├── train_strategy_student_mlp.py
-│   └── train_cot_tp_film.py
-├── requirements.txt
-├── .gitignore
-└── README.md
+|-- scripts/
+|   |-- generate_llm_teacher.py
+|   |-- parse_strategy_vectors.py
+|   |-- train_strategy_student_mlp.py
+|   `-- train_cot_tp_film.py
+|-- baselines/
+|   `-- llc_pc/
+|       |-- configs/
+|       |-- docs/
+|       |-- llc_pc/
+|       |-- scripts/
+|       |-- tests/
+|       |-- README.md
+|       |-- CITATION.md
+|       `-- THIRD_PARTY.md
+|-- requirements.txt
+|-- .gitignore
+`-- README.md
 ```
 
-Generated data, model checkpoints, and outputs are intentionally excluded from
-the repository. Place local datasets and outputs under ignored folders such as
-`data/`, `doc/`, `outputs/`, or `checkpoints/`.
+Generated data, model checkpoints, LLM responses, rendered context maps, and
+outputs are intentionally excluded. Place private datasets and generated
+artifacts only under ignored directories such as `data/`, `doc/`, `outputs/`,
+or `checkpoints/`.
 
 ## Installation
 
@@ -29,7 +41,7 @@ the repository. Place local datasets and outputs under ignored folders such as
 pip install -r requirements.txt
 ```
 
-## Pipeline
+## CoT-TP Pipeline
 
 ### 1. Generate LLM Teacher Responses
 
@@ -59,8 +71,8 @@ python scripts/generate_llm_teacher.py \
 Call an OpenAI-compatible LLM endpoint:
 
 ```bash
-set LLM_API_KEY=your_api_key
-set LLM_BASE_URL=your_openai_compatible_base_url
+export LLM_API_KEY="YOUR_API_KEY"
+export LLM_BASE_URL="YOUR_OPENAI_COMPATIBLE_BASE_URL"
 
 python scripts/generate_llm_teacher.py \
   --data-path data/test_dataset.mat \
@@ -81,6 +93,10 @@ python scripts/generate_llm_teacher.py \
   --output-dir outputs/llm_cot
 ```
 
+On PowerShell, set the variables with
+`$env:LLM_API_KEY="YOUR_API_KEY"` and
+`$env:LLM_BASE_URL="YOUR_OPENAI_COMPATIBLE_BASE_URL"`.
+
 ### 2. Parse Strategy Vectors
 
 ```bash
@@ -93,7 +109,7 @@ python scripts/parse_strategy_vectors.py \
 The parser writes `ids.npy`, `c.npy`, `vocab.json`, `meta.csv`,
 `records.jsonl`, `summary.json`, and optionally `errors.log`.
 
-### 3. Distill The MLP Strategy Student
+### 3. Distill the MLP Strategy Student
 
 ```bash
 python scripts/train_strategy_student_mlp.py \
@@ -112,7 +128,7 @@ python scripts/train_strategy_student_mlp.py \
   --neighbor-lat-v-col NEIGHBOR_LAT_V_COL
 ```
 
-### 4. Train The CoT-TP FiLM Predictor
+### 4. Train the CoT-TP FiLM Predictor
 
 ```bash
 python scripts/train_cot_tp_film.py \
@@ -127,22 +143,33 @@ python scripts/train_cot_tp_film.py \
 
 Run any script with `--help` to inspect all options.
 
-## GitHub Upload
+## LLC-PC Baseline
 
-From this folder:
+LLC-PC is an independent, domain-adapted implementation following the semantic
+context conditioning design of Zheng et al., *Large Language Models Powered
+Context-aware Motion Prediction*. It converts structured LLM output into a
+17-dimensional context representation. The context and training-derived
+intention anchors are projected separately and combined into the queries of a
+compact MTR-style decoder. It is not an exact reproduction of the original WOMD
+implementation and does not copy the original source code or prompt.
+
+The public repository contains no crash trajectories, generated LLM responses,
+or model weights. See [the LLC-PC guide](baselines/llc_pc/README.md) for the
+expected local data schema, leakage controls, configuration, and commands.
+
+## Release Checks
+
+Before committing public changes, inspect tracked and untracked files and scan
+for accidental credentials or machine-specific paths:
 
 ```bash
-git init
-git add .
-git commit -m "Release CoT-TP core code"
-git branch -M main
-git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git
-git push -u origin main
-```
-
-Before pushing, run:
-
-```bash
-rg -n "sk-|E:\\|D:\\|[\p{Han}]|dashscope|compatible-mode" .
+git status --short
+rg -l --hidden -g '!.git/**' -g '!*.md' -g '!*.example.json' "sk-[A-Za-z0-9_-]{20,}|dashscope|compatible-mode" .
+rg -l -F --hidden -g '!.git/**' -g '!*.md' 'C:\' .
+rg -l -F --hidden -g '!.git/**' -g '!*.md' 'D:\' .
+rg -l -F --hidden -g '!.git/**' -g '!*.md' 'E:\' .
 python -m py_compile scripts/generate_llm_teacher.py scripts/parse_strategy_vectors.py scripts/train_strategy_student_mlp.py scripts/train_cot_tp_film.py
 ```
+
+Never commit datasets, API credentials, generated responses, checkpoints, or
+absolute local paths.
