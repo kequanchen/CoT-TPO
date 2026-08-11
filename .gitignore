@@ -26,13 +26,17 @@ mlruns/
 *.parquet
 *.feather
 *.jsonl
+*.jsonl.tmp
 *.sqlite
 *.sqlite3
 *.db
 *.pth
 *.pt
 *.ckpt
+*.safetensors
+*.bin
 *.onnx
+*.tmp
 *.log
 *.mp4
 *.avi
@@ -49,6 +53,9 @@ baselines/llc_pc/raw_contexts/
 baselines/llc_pc/encoded_contexts/
 baselines/llc_pc/external/
 baselines/llc_pc/vendor/
+
+# LC-LLM local-only files
+baselines/lc_llm/configs/*.local.json
 
 # Secrets and local environments
 .env

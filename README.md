@@ -2,9 +2,9 @@
 
 This repository contains the paper-aligned implementation of CoT-TP. The core
 pipeline covers LLM teacher reasoning, strategy-vector parsing, MLP student
-distillation, and FiLM-conditioned trajectory prediction. It also contains the
-independently implemented **LLC-PC** baseline adapted to the post-crash
-lane-changing data format used in the study.
+distillation, and FiLM-conditioned trajectory prediction. It also contains
+independently implemented, post-crash adaptations of the **LLC-PC** and
+**LC-LLM** baselines used in the study.
 
 ## Repository Structure
 
@@ -16,10 +16,19 @@ lane-changing data format used in the study.
 |   |-- train_strategy_student_mlp.py
 |   `-- train_cot_tp_film.py
 |-- baselines/
-|   `-- llc_pc/
+|   |-- llc_pc/
+|   |   |-- configs/
+|   |   |-- docs/
+|   |   |-- llc_pc/
+|   |   |-- scripts/
+|   |   |-- tests/
+|   |   |-- README.md
+|   |   |-- CITATION.md
+|   |   `-- THIRD_PARTY.md
+|   `-- lc_llm/
 |       |-- configs/
 |       |-- docs/
-|       |-- llc_pc/
+|       |-- lc_llm/
 |       |-- scripts/
 |       |-- tests/
 |       |-- README.md
@@ -156,6 +165,17 @@ implementation and does not copy the original source code or prompt.
 The public repository contains no crash trajectories, generated LLM responses,
 or model weights. See [the LLC-PC guide](baselines/llc_pc/README.md) for the
 expected local data schema, leakage controls, configuration, and commands.
+
+## LC-LLM Baseline
+
+LC-LLM (adapted) is an independent, paper-based reconstruction of the direct
+joint reasoning, lane-change intention, and trajectory-token generation method
+described by Peng et al. Its Figure 3 prompt organization and reported LoRA
+settings are retained where specified, while the inputs and output sampling are
+adapted to the post-crash dataset. It is not presented as author-released code
+or an exact numerical reproduction. See [the LC-LLM guide](baselines/lc_llm/README.md)
+for the adaptation table, private-data interface, training and evaluation
+commands, and attribution notice.
 
 ## Release Checks
 
