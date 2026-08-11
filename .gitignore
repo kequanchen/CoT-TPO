@@ -57,6 +57,9 @@ baselines/llc_pc/vendor/
 # LC-LLM local-only files
 baselines/lc_llm/configs/*.local.json
 
+# Direct LLM local-only files
+baselines/direct_llm/configs/*.local.json
+
 # Secrets and local environments
 .env
 .env.*

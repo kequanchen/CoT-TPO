@@ -1,0 +1,43 @@
+{
+  "data": {
+    "test_mat": "<PATH_TO_TEST_MAT>",
+    "test_key": "test_data",
+    "history_steps": 10,
+    "future_steps": 50,
+    "sample_rate_hz": 10.0,
+    "neighbor_roles": [
+      "phys_tl",
+      "phys_tf",
+      "phys_tff",
+      "phys_ol",
+      "phys_of",
+      "phys_off"
+    ]
+  },
+  "prompt": {
+    "context_mode": "target_and_neighbors",
+    "trajectory_precision": 2,
+    "max_neighbors": 6
+  },
+  "paths": {
+    "test_prompts": "outputs/direct_llm/datasets/test_prompts.jsonl",
+    "predictions": "outputs/direct_llm/predictions/test_predictions.jsonl",
+    "metrics": "outputs/direct_llm/evaluation/test_metrics.json"
+  },
+  "llm": {
+    "model": "qwen-plus",
+    "api_key_env": "LLM_API_KEY",
+    "base_url_env": "LLM_BASE_URL",
+    "temperature": 0.3,
+    "max_tokens": 4096,
+    "timeout_seconds": 120,
+    "max_api_retries": 4,
+    "max_format_retries": 2,
+    "initial_backoff_seconds": 1.0
+  },
+  "evaluation": {
+    "horizons_seconds": [1, 2, 3, 4, 5],
+    "require_full_coverage": true,
+    "prediction_mode": "top1"
+  }
+}

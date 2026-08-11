@@ -4,7 +4,8 @@ This repository contains the paper-aligned implementation of CoT-TP. The core
 pipeline covers LLM teacher reasoning, strategy-vector parsing, MLP student
 distillation, and FiLM-conditioned trajectory prediction. It also contains
 independently implemented, post-crash adaptations of the **LLC-PC** and
-**LC-LLM** baselines used in the study.
+**LC-LLM** baselines used in the study, together with a **Direct LLM** baseline
+adapted from the LMTraj-ZERO coordinate-generation paradigm.
 
 ## Repository Structure
 
@@ -25,10 +26,19 @@ independently implemented, post-crash adaptations of the **LLC-PC** and
 |   |   |-- README.md
 |   |   |-- CITATION.md
 |   |   `-- THIRD_PARTY.md
-|   `-- lc_llm/
+|   |-- lc_llm/
+|   |   |-- configs/
+|   |   |-- docs/
+|   |   |-- lc_llm/
+|   |   |-- scripts/
+|   |   |-- tests/
+|   |   |-- README.md
+|   |   |-- CITATION.md
+|   |   `-- THIRD_PARTY.md
+|   `-- direct_llm/
 |       |-- configs/
 |       |-- docs/
-|       |-- lc_llm/
+|       |-- direct_llm/
 |       |-- scripts/
 |       |-- tests/
 |       |-- README.md
@@ -176,6 +186,19 @@ adapted to the post-crash dataset. It is not presented as author-released code
 or an exact numerical reproduction. See [the LC-LLM guide](baselines/lc_llm/README.md)
 for the adaptation table, private-data interface, training and evaluation
 commands, and attribution notice.
+
+## Direct LLM Baseline
+
+Direct LLM is an independent post-crash adaptation of the zero-shot coordinate
+generation paradigm in Bae et al.'s LMTraj. It serializes the observed motion
+as text and asks an LLM to return one future coordinate sequence directly,
+without explicit chain-of-thought prompting, an intermediate behavioral
+interface, or a separately learned trajectory decoder. The implementation uses
+strict JSON validation and reports top-1 ADE/FDE under the same 1--5 s horizons
+as CoT-TP;
+it does not use LMTraj's oracle best-of-20 evaluation in the main comparison.
+See [the Direct LLM guide](baselines/direct_llm/README.md) for the exact source
+method, domain adaptations, private-data interface, and commands.
 
 ## Release Checks
 
