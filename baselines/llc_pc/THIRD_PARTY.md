@@ -1,6 +1,6 @@
-# Third-Party References for LLC-PC
+# Third-Party References for LLM-PC
 
-LLC-PC is an independent, domain-adapted implementation. No source files,
+LLM-PC is an independent, domain-adapted implementation. No source files,
 prompt text, model weights, or data from the projects below are copied into this
 directory.
 
@@ -40,5 +40,5 @@ geometry, and standardized flattened observation features. It retains the
 17-dimensional action, affordance, and scenario interface. Semantic contexts
 and intention-point anchors are projected independently and then combined into
 the query tokens of a compact MTR-style decoder. Consequently, results should
-be described as **LLC-PC, an independent post-crash lane-changing adaptation
+be described as **LLM-PC, an independent post-crash lane-changing adaptation
 following Zheng et al.**, not as an exact reproduction of LLM-Augmented-MTR.

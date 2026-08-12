@@ -1,6 +1,6 @@
-# LLC-PC
+# LLM-PC
 
-LLC-PC is an independently implemented baseline that adapts the semantic
+LLM-PC is an independently implemented baseline that adapts the semantic
 context conditioning workflow of Zheng et al., *Large Language Models Powered
 Context-aware Motion Prediction*, to the post-crash lane-changing data format
 used by CoT-TP.
@@ -77,8 +77,40 @@ MATLAB fields and [third-party references](THIRD_PARTY.md) for provenance.
 
 ## Configuration
 
-LLC-PC requires Python 3.10 or newer and the packages listed in the repository
+LLM-PC requires Python 3.10 or newer and the packages listed in the repository
 root `requirements.txt`.
+
+The reference method used the unfine-tuned GPT-4V
+(`gpt-4-vision-preview`) with in-context examples to interpret the rendered
+traffic-context map and accompanying text. This domain-adapted example keeps
+the vision-language backend configurable through an OpenAI-compatible API.
+When the historical GPT-4V snapshot is unavailable, an accessible multimodal
+model such as Qwen-VL can be used without fine-tuning, provided that it accepts
+the same image-plus-text input and returns the required structured schema.
+Qwen vision models can be called through an OpenAI-compatible endpoint by
+setting the model name, regional base URL, and API key in the local
+configuration. See the
+[official Qwen-VL OpenAI-compatible API guide](https://help.aliyun.com/en/model-studio/qwen-vl-compatible-with-openai).
+
+For example, the local, ignored configuration may use:
+
+```json
+{
+  "llm": {
+    "model": "qwen3-vl-plus",
+    "base_url_env": "LLM_BASE_URL",
+    "api_key_env": "LLM_API_KEY",
+    "temperature": 0.7,
+    "max_tokens": 1200,
+    "seed": 42
+  }
+}
+```
+
+The public example selects `qwen3-vl-plus` as an accessible backend. Users may
+replace it with another image-capable model exposed through the same API. The
+selected VLM is used only to construct structured semantic contexts; the
+downstream motion predictor is trained separately.
 
 All commands below are run from `baselines/llc_pc`:
 
@@ -182,7 +214,7 @@ python scripts/train.py \
   --config configs/post_crash_lc.local.json
 ```
 
-### 5. Evaluate with the Highest-Probability Trajectory
+### 5. Evaluate
 
 ```bash
 python scripts/evaluate.py \
@@ -190,9 +222,8 @@ python scripts/evaluate.py \
   --checkpoint <PATH_TO_LLC_PC_CHECKPOINT>
 ```
 
-The paper-aligned configuration uses `prediction_mode: "top1"`. This evaluates
-the trajectory with the highest predicted probability rather than selecting an
-oracle best trajectory from the six generated modes.
+The evaluator reports ADE/FDE for the highest-probability trajectory among the
+generated modes over the configured prediction horizons.
 
 ## Leakage Controls
 
@@ -213,7 +244,7 @@ layout. Do not weaken them when adapting the loader to another private dataset.
 ## Domain Adaptation Notes
 
 The post-crash LC data do not contain the complete lane graph, intersections,
-crosswalks, or traffic-control elements available in WOMD. LLC-PC therefore
+crosswalks, or traffic-control elements available in WOMD. LLM-PC therefore
 constructs local parallel lane geometry from observed lane information and uses
 the ego plus six defined neighboring-vehicle roles. Missing neighbors are
 masked.
@@ -241,10 +272,11 @@ private crash dataset or an LLM API call.
 
 ## Reporting and Citation
 
-Use the name **LLC-PC** in tables and figures. A precise methodological
+Use the name **LLM-PC** in tables and figures. The internal package directory
+remains `llc_pc` for compatibility. A precise methodological
 description is:
 
-> LLC-PC is an independently implemented, domain-adapted baseline following the
+> LLM-PC is an independently implemented, domain-adapted baseline following the
 > semantic-context conditioning design of Zheng et al. Structured action,
 > affordance, and scenario outputs are encoded into a 17-dimensional context
 > representation. The context and training-derived intention points are

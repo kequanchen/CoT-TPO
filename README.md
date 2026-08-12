@@ -3,7 +3,7 @@
 This repository contains the paper-aligned implementation of CoT-TP. The core
 pipeline covers LLM teacher reasoning, strategy-vector parsing, MLP student
 distillation, and FiLM-conditioned trajectory prediction. It also contains
-independently implemented, post-crash adaptations of the **LLC-PC** and
+independently implemented, post-crash adaptations of the **LLM-PC** and
 **LC-LLM** baselines used in the study, together with a **Direct LLM** baseline
 adapted from the LMTraj-ZERO coordinate-generation paradigm.
 
@@ -157,14 +157,20 @@ python scripts/train_cot_tp_film.py \
   --test-vector-dir doc/testinput \
   --student-ckpt outputs/student_mlp/strategy_student_distill.pth \
   --out-dir outputs/cot_tp_film \
+  --eval-repeats 20 \
   --require-student-ckpt
 ```
 
+The internal `--num-samples` setting controls the number of stochastic CVAE
+candidate trajectories averaged to form the baseline trajectory in Eq. (9).
+For paper-aligned evaluation, the complete stochastic prediction is repeated
+20 times and ADE/FDE are averaged across these repeats (`--eval-repeats 20`).
+
 Run any script with `--help` to inspect all options.
 
-## LLC-PC Baseline
+## LLM-PC Baseline
 
-LLC-PC is an independent, domain-adapted implementation following the semantic
+LLM-PC is an independent, domain-adapted implementation following the semantic
 context conditioning design of Zheng et al., *Large Language Models Powered
 Context-aware Motion Prediction*. It converts structured LLM output into a
 17-dimensional context representation. The context and training-derived
@@ -173,7 +179,7 @@ compact MTR-style decoder. It is not an exact reproduction of the original WOMD
 implementation and does not copy the original source code or prompt.
 
 The public repository contains no crash trajectories, generated LLM responses,
-or model weights. See [the LLC-PC guide](baselines/llc_pc/README.md) for the
+or model weights. See [the LLM-PC guide](baselines/llc_pc/README.md) for the
 expected local data schema, leakage controls, configuration, and commands.
 
 ## LC-LLM Baseline
@@ -194,9 +200,8 @@ generation paradigm in Bae et al.'s LMTraj. It serializes the observed motion
 as text and asks an LLM to return one future coordinate sequence directly,
 without explicit chain-of-thought prompting, an intermediate behavioral
 interface, or a separately learned trajectory decoder. The implementation uses
-strict JSON validation and reports top-1 ADE/FDE under the same 1--5 s horizons
-as CoT-TP;
-it does not use LMTraj's oracle best-of-20 evaluation in the main comparison.
+strict JSON validation and reports ADE/FDE under the same 1--5 s prediction
+horizons as CoT-TP.
 See [the Direct LLM guide](baselines/direct_llm/README.md) for the exact source
 method, domain adaptations, private-data interface, and commands.
 

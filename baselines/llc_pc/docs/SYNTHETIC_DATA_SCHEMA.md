@@ -1,4 +1,4 @@
-# Synthetic Data Schema for LLC-PC
+# Synthetic Data Schema for LLM-PC
 
 No trajectory data are distributed with this repository. This document uses
 synthetic identifiers and array shapes only to describe the local MATLAB input
@@ -71,7 +71,7 @@ Each neighbor matrix uses:
 [ID, LANE_ID, X, Y, VX, VY, ACC, YAW]
 ```
 
-The LLC-PC adapter reads the kinematic values and lane-boundary information
+The LLM-PC adapter reads the kinematic values and lane-boundary information
 through an explicit `DatasetLayout`. If a private dataset uses different column
 positions, update the local layout instead of changing the semantic encoding.
 Coordinates are expected in metres, velocities in metres per second,

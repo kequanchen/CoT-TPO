@@ -1,7 +1,7 @@
-# Citation Guidance for LLC-PC
+# Citation Guidance for LLM-PC
 
-When using LLC-PC, cite the CoT-TP article associated with this repository and
-the following method and architecture references. The LLC-PC implementation
+When using LLM-PC, cite the CoT-TP article associated with this repository and
+the following method and architecture references. The LLM-PC implementation
 should be described as a domain adaptation, not an exact reproduction.
 
 ```bibtex
@@ -24,7 +24,7 @@ should be described as a domain adaptation, not an exact reproduction.
 
 Recommended implementation wording:
 
-> LLC-PC is an independently implemented, domain-adapted baseline following the
+> LLM-PC is an independently implemented, domain-adapted baseline following the
 > semantic-context conditioning design of Zheng et al. The data adapter, local
 > context-map renderer, observation-based retrieval features, prompt, and
 > compact MTR-style predictor were implemented for the post-crash lane-changing

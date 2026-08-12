@@ -542,7 +542,24 @@ def parse_args():
     parser.add_argument("--transformer-layers", type=int, default=2)
     parser.add_argument("--alpha-recon", type=float, default=0.3)
     parser.add_argument("--beta-kl", type=float, default=0.001)
-    parser.add_argument("--num-samples", type=int, default=5)
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=5,
+        help=(
+            "Number of stochastic CVAE candidate trajectories averaged to form "
+            "each baseline trajectory in Eq. (9)"
+        ),
+    )
+    parser.add_argument(
+        "--eval-repeats",
+        type=int,
+        default=20,
+        help=(
+            "Number of independent stochastic predictions used to compute the "
+            "mean evaluation metrics"
+        ),
+    )
     parser.add_argument("--strategy-dropout-p", type=float, default=0.0)
     parser.add_argument("--film-gamma-scale", type=float, default=0.25)
     parser.add_argument("--film-beta-scale", type=float, default=0.10)
@@ -559,6 +576,10 @@ def parse_args():
     args.test_vector_dir = resolve_path(args.test_vector_dir)
     args.student_ckpt = resolve_path(args.student_ckpt)
     args.out_dir = resolve_path(args.out_dir)
+    if args.num_samples <= 0:
+        raise ValueError("--num-samples must be positive")
+    if args.eval_repeats <= 0:
+        raise ValueError("--eval-repeats must be positive")
     return args
 
 
@@ -783,23 +804,43 @@ def main():
                 else:
                     strategy_in = llm_offline
 
-                final_norm, _, _, _, film_strength = model(
-                    hist_norm,
-                    strategy_in,
-                    num_samples=args.num_samples,
-                    strategy_dropout_p=0.0,
-                )
-                mse_loss = mse(final_norm, target_norm)
-                final = denormalize_target(final_norm, target_mean, target_std)
                 target = denormalize_target(target_norm, target_mean, target_std)
-                ade_det, fde_det = ade_fde_from_flat(final, target, pred_len=args.pred_len)
+
+                # Each repeat is a complete stochastic prediction. Within each
+                # repeat, ``num_samples`` CVAE candidates are averaged as in
+                # Eq. (9) before the residual trajectory is produced.
+                repeat_mse = 0.0
+                repeat_ade = 0.0
+                repeat_fde = 0.0
+                repeat_film_strength = 0.0
+                for _ in range(args.eval_repeats):
+                    final_norm, _, _, _, film_strength = model(
+                        hist_norm,
+                        strategy_in,
+                        num_samples=args.num_samples,
+                        strategy_dropout_p=0.0,
+                    )
+                    mse_loss = mse(final_norm, target_norm)
+                    final = denormalize_target(final_norm, target_mean, target_std)
+                    ade_det, fde_det = ade_fde_from_flat(
+                        final, target, pred_len=args.pred_len
+                    )
+                    repeat_mse += float(mse_loss)
+                    repeat_ade += float(ade_det)
+                    repeat_fde += float(fde_det)
+                    repeat_film_strength += float(film_strength.detach())
+
+                repeat_mse /= args.eval_repeats
+                repeat_ade /= args.eval_repeats
+                repeat_fde /= args.eval_repeats
+                repeat_film_strength /= args.eval_repeats
 
                 batch_size = hist_norm.size(0)
                 n_test += batch_size
-                test_mse += mse_loss.item() * batch_size
-                test_ade_det += float(ade_det) * batch_size
-                test_fde_det += float(fde_det) * batch_size
-                test_film_sum += float(film_strength.detach()) * batch_size
+                test_mse += repeat_mse * batch_size
+                test_ade_det += repeat_ade * batch_size
+                test_fde_det += repeat_fde * batch_size
+                test_film_sum += repeat_film_strength * batch_size
 
         test_mse /= n_test
         test_ade_det /= n_test
