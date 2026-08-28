@@ -35,6 +35,11 @@ except ImportError:  # pragma: no cover - only triggered in incomplete envs.
     OpenAI = None
 
 
+DEFAULT_TEACHER_MODEL = "qwen3-235b-a22b"
+DEFAULT_TEACHER_TEMPERATURE = 0.3
+DEFAULT_TEACHER_MAX_TOKENS = 2000
+
+
 MERGE_STRATEGIES = [
     "DECISIVE_MERGE",
     "PROBING_APPROACH",
@@ -854,19 +859,19 @@ def call_llm(
     model: str,
     temperature: float,
     max_tokens: int,
-    enable_thinking: bool = False,
+    enable_thinking: bool = True,
+    stream: bool = True,
 ) -> Dict[str, Any]:
     """Call the LLM and parse a JSON object from the response."""
 
-    kwargs: Dict[str, Any] = {}
-    if enable_thinking:
-        kwargs["extra_body"] = {"enable_thinking": True}
-
     content = ""
+    reasoning_content = ""
+    content_parts: List[str] = []
+    reasoning_parts: List[str] = []
     try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
+        request: Dict[str, Any] = {
+            "model": model,
+            "messages": [
                 {
                     "role": "system",
                     "content": (
@@ -878,27 +883,84 @@ def call_llm(
                 },
                 {"role": "user", "content": prompt},
             ],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            **kwargs,
-        )
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "extra_body": {"enable_thinking": bool(enable_thinking)},
+            "stream": stream,
+        }
+        if stream:
+            request["stream_options"] = {"include_usage": True}
 
-        print("served_model =", getattr(response, "model", None))
-        print("usage =", getattr(response, "usage", None))
-        content = response.choices[0].message.content
+        response = client.chat.completions.create(**request)
+
+        served_model = None
+        usage = None
+        if stream:
+            for chunk in response:
+                served_model = getattr(chunk, "model", served_model)
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    usage = chunk_usage
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                delta = getattr(choices[0], "delta", None)
+                if delta is None:
+                    continue
+                reasoning_piece = getattr(delta, "reasoning_content", None)
+                if reasoning_piece:
+                    reasoning_parts.append(reasoning_piece)
+                content_piece = getattr(delta, "content", None)
+                if content_piece:
+                    content_parts.append(content_piece)
+            reasoning_content = "".join(reasoning_parts)
+            content = "".join(content_parts)
+        else:
+            served_model = getattr(response, "model", None)
+            usage = getattr(response, "usage", None)
+            message = response.choices[0].message
+            reasoning_content = getattr(message, "reasoning_content", None) or ""
+            content = message.content or ""
+
+        print("served_model =", served_model)
+        print("usage =", usage)
 
         json_start = content.find("{")
         json_end = content.rfind("}") + 1
         if json_start == -1 or json_end <= json_start:
-            return {"success": False, "raw_response": content, "error": "No JSON object found in LLM response."}
+            return {
+                "success": False,
+                "raw_response": content,
+                "reasoning_content": reasoning_content,
+                "error": "No JSON object found in LLM response.",
+            }
 
         parsed = json.loads(content[json_start:json_end])
-        return {"success": True, "raw_response": content, "parsed_result": parsed}
+        return {
+            "success": True,
+            "raw_response": content,
+            "reasoning_content": reasoning_content,
+            "parsed_result": parsed,
+        }
 
     except json.JSONDecodeError as exc:
-        return {"success": False, "raw_response": content, "error": f"JSON parse error: {exc}"}
+        content = "".join(content_parts) or content
+        reasoning_content = "".join(reasoning_parts) or reasoning_content
+        return {
+            "success": False,
+            "raw_response": content,
+            "reasoning_content": reasoning_content,
+            "error": f"JSON parse error: {exc}",
+        }
     except Exception as exc:
-        return {"success": False, "raw_response": content, "error": f"LLM call failed: {exc}"}
+        content = "".join(content_parts) or content
+        reasoning_content = "".join(reasoning_parts) or reasoning_content
+        return {
+            "success": False,
+            "raw_response": content,
+            "reasoning_content": reasoning_content,
+            "error": f"LLM call failed: {exc}",
+        }
 
 
 def process_sample(
@@ -916,7 +978,8 @@ def process_sample(
     verbose: bool = True,
     save_prompt: bool = True,
     skip_llm: bool = False,
-    enable_thinking: bool = False,
+    enable_thinking: bool = True,
+    stream: bool = True,
 ) -> Dict[str, Any]:
     """Generate a prompt for one sample and optionally call the LLM."""
 
@@ -946,7 +1009,15 @@ def process_sample(
     if client is None:
         raise RuntimeError("A client is required unless skip_llm=True.")
 
-    llm_result = call_llm(prompt, client, model, temperature, max_tokens, enable_thinking=enable_thinking)
+    llm_result = call_llm(
+        prompt,
+        client,
+        model,
+        temperature,
+        max_tokens,
+        enable_thinking=enable_thinking,
+        stream=stream,
+    )
 
     if save_prompt:
         with response_file.open("w", encoding="utf-8") as f:
@@ -1118,7 +1189,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--random-sample", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/llm_cot"))
-    parser.add_argument("--model", type=str, default="qwen-plus")
+    parser.add_argument("--model", type=str, default=DEFAULT_TEACHER_MODEL)
     parser.add_argument("--base-url", type=str, default=os.getenv("LLM_BASE_URL"))
     parser.add_argument("--api-key-env", type=str, default="LLM_API_KEY")
     parser.add_argument("--vehicle-length", type=float, default=env_float("COTTP_VEHICLE_LENGTH"))
@@ -1136,12 +1207,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neighbor-lat-v-col", type=int, default=env_int("COTTP_NEIGHBOR_LAT_V_COL"))
     parser.add_argument("--neighbor-acc-col", type=int, default=env_int("COTTP_NEIGHBOR_ACC_COL"))
     parser.add_argument("--neighbor-yaw-col", type=int, default=env_int("COTTP_NEIGHBOR_YAW_COL"))
-    parser.add_argument("--temperature", type=float, default=0.3)
-    parser.add_argument("--max-tokens", type=int, default=2000)
-    parser.add_argument("--enable-thinking", action="store_true")
+    parser.add_argument("--temperature", type=float, default=DEFAULT_TEACHER_TEMPERATURE)
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_TEACHER_MAX_TOKENS)
+    thinking_group = parser.add_mutually_exclusive_group()
+    thinking_group.add_argument("--enable-thinking", dest="enable_thinking", action="store_true")
+    thinking_group.add_argument("--disable-thinking", dest="enable_thinking", action="store_false")
+    stream_group = parser.add_mutually_exclusive_group()
+    stream_group.add_argument("--stream", dest="stream", action="store_true")
+    stream_group.add_argument("--no-stream", dest="stream", action="store_false")
     parser.add_argument("--skip-llm", action="store_true", help="Only generate and save prompts; do not call the LLM.")
     parser.add_argument("--no-save-prompt", action="store_false", dest="save_prompt")
-    parser.set_defaults(save_prompt=True)
+    parser.set_defaults(save_prompt=True, enable_thinking=True, stream=True)
     return parser.parse_args()
 
 
@@ -1242,6 +1318,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             save_prompt=args.save_prompt,
             skip_llm=args.skip_llm,
             enable_thinking=args.enable_thinking,
+            stream=args.stream,
         )
         batch_records.append(
             {
@@ -1302,9 +1379,9 @@ def batch_process(
             samples[idx],
             idx,
             client=None,
-            model="qwen-plus",
-            temperature=0.3,
-            max_tokens=2000,
+            model=DEFAULT_TEACHER_MODEL,
+            temperature=DEFAULT_TEACHER_TEMPERATURE,
+            max_tokens=DEFAULT_TEACHER_MAX_TOKENS,
             vehicle_length=vehicle_length,
             vehicle_width=vehicle_width,
             ego_cols=ego_cols,
@@ -1313,6 +1390,8 @@ def batch_process(
             verbose=False,
             save_prompt=True,
             skip_llm=skip_llm,
+            enable_thinking=True,
+            stream=True,
         )
         records.append({"sample_idx": idx, "success": result.get("success", False), "prompt_file": f"prompt_sample_{idx}.txt"})
 

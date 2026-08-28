@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -57,6 +58,7 @@ class ValidationProtocolTests(unittest.TestCase):
                 output_dir=output_dir,
                 save_prompt=True,
                 enable_thinking=False,
+                stream=True,
             )
             processed: list[int] = []
 
@@ -143,6 +145,151 @@ class ValidationProtocolTests(unittest.TestCase):
                 self.student.load_teacher_vectors(vector_dir)
             with self.assertRaisesRegex(ValueError, "unique"):
                 self.trajectory.load_llm_vectors(vector_dir)
+
+    def test_paper_teacher_defaults_to_qwen3_thinking_stream(self) -> None:
+        with mock.patch.object(sys, "argv", ["generate_llm_teacher.py"]):
+            args = self.teacher.parse_args()
+        self.assertEqual(args.model, "qwen3-235b-a22b")
+        self.assertTrue(args.enable_thinking)
+        self.assertTrue(args.stream)
+
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["generate_llm_teacher.py", "--disable-thinking", "--no-stream"],
+        ):
+            disabled = self.teacher.parse_args()
+        self.assertFalse(disabled.enable_thinking)
+        self.assertFalse(disabled.stream)
+
+    def test_qwen3_streaming_response_is_collected_and_parsed(self) -> None:
+        chunks = [
+            SimpleNamespace(
+                model="qwen3-235b-a22b",
+                usage=None,
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(reasoning_content="reasoning ", content=None)
+                    )
+                ],
+            ),
+            SimpleNamespace(
+                model="qwen3-235b-a22b",
+                usage=None,
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(reasoning_content=None, content='{"status":')
+                    )
+                ],
+            ),
+            SimpleNamespace(
+                model="qwen3-235b-a22b",
+                usage=None,
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(reasoning_content=None, content=' "ok"}')
+                    )
+                ],
+            ),
+            SimpleNamespace(
+                model="qwen3-235b-a22b",
+                usage=SimpleNamespace(total_tokens=12),
+                choices=[],
+            ),
+        ]
+        create = mock.Mock(return_value=iter(chunks))
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        result = self.teacher.call_llm(
+            "prompt",
+            client,
+            "qwen3-235b-a22b",
+            temperature=0.3,
+            max_tokens=2000,
+            enable_thinking=True,
+            stream=True,
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["parsed_result"], {"status": "ok"})
+        self.assertEqual(result["reasoning_content"], "reasoning ")
+        request = create.call_args.kwargs
+        self.assertTrue(request["stream"])
+        self.assertEqual(request["extra_body"], {"enable_thinking": True})
+
+    def test_non_thinking_request_explicitly_disables_thinking(self) -> None:
+        response = SimpleNamespace(
+            model="qwen3-235b-a22b",
+            usage=None,
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content='{"status": "ok"}', reasoning_content=None)
+                )
+            ],
+        )
+        create = mock.Mock(return_value=response)
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        result = self.teacher.call_llm(
+            "prompt",
+            client,
+            "qwen3-235b-a22b",
+            temperature=0.3,
+            max_tokens=2000,
+            enable_thinking=False,
+            stream=False,
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(
+            create.call_args.kwargs["extra_body"], {"enable_thinking": False}
+        )
+
+    def test_strategy_student_remains_frozen_downstream(self) -> None:
+        torch = self.trajectory.torch
+        student = self.trajectory.StrategyStudent(in_dim=4, hid_dim=8, out_dim=3)
+        self.trajectory.freeze_student(student)
+
+        self.assertFalse(student.training)
+        self.assertTrue(all(not parameter.requires_grad for parameter in student.parameters()))
+
+        model = torch.nn.Linear(4, 2)
+        optimizer = self.trajectory.build_optimizer(
+            model,
+            argparse.Namespace(
+                lr=1e-4,
+                film_lr=1.5e-4,
+                weight_decay=1e-4,
+                film_weight_decay=0.0,
+            ),
+        )
+        optimizer_ids = {
+            id(parameter)
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        }
+        student_ids = {id(parameter) for parameter in student.parameters()}
+        self.assertTrue(optimizer_ids.isdisjoint(student_ids))
+
+        source = (ROOT / "scripts" / "train_cot_tp_film.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("unfreezing StrategyStudent", source)
+        self.assertNotIn("requires_grad_(True)", source)
+        self.assertNotIn("phase1_epochs", source)
+
+    def test_frozen_student_requires_a_checkpoint(self) -> None:
+        student = self.trajectory.StrategyStudent(in_dim=4, hid_dim=8, out_dim=3)
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = Path(temporary) / "missing.pth"
+            with self.assertRaisesRegex(FileNotFoundError, "Student checkpoint not found"):
+                self.trajectory.load_student_checkpoint(
+                    student, missing, self.trajectory.torch.device("cpu")
+                )
 
 
 if __name__ == "__main__":

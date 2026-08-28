@@ -534,7 +534,7 @@ def evaluate_trajectory_model(
     }
 
 
-def build_optimizer(model: nn.Module, args, student: nn.Module | None = None, phase2: bool = False):
+def build_optimizer(model: nn.Module, args):
     film_params = []
     base_params = []
     for name, param in model.named_parameters():
@@ -549,41 +549,36 @@ def build_optimizer(model: nn.Module, args, student: nn.Module | None = None, ph
         {"params": base_params, "lr": args.lr, "weight_decay": args.weight_decay},
         {"params": film_params, "lr": args.film_lr, "weight_decay": args.film_weight_decay},
     ]
-    if phase2 and student is not None:
-        student_params = [param for param in student.parameters() if param.requires_grad]
-        if student_params:
-            groups.append(
-                {
-                    "params": student_params,
-                    "lr": args.student_lr,
-                    "weight_decay": args.student_weight_decay,
-                }
-            )
     return optim.Adam(groups)
 
 
-def load_student_checkpoint(student: nn.Module, ckpt_path: Path, device, required: bool) -> bool:
+def load_student_checkpoint(student: nn.Module, ckpt_path: Path, device) -> None:
     if ckpt_path is None or not ckpt_path.exists():
-        if required:
-            raise FileNotFoundError(f"Student checkpoint not found: {ckpt_path}")
-        print(f"[Warning] Student checkpoint not found: {ckpt_path}. The student is randomly initialized.")
-        return False
+        raise FileNotFoundError(f"Student checkpoint not found: {ckpt_path}")
 
     checkpoint = torch.load(str(ckpt_path), map_location=device, weights_only=False)
     for key in ["state_dict", "model", "student"]:
         if isinstance(checkpoint, dict) and key in checkpoint and isinstance(checkpoint[key], dict):
             student.load_state_dict(checkpoint[key], strict=True)
             print(f"Loaded student weights from key='{key}'")
-            return True
+            return
     if isinstance(checkpoint, nn.Module):
         student.load_state_dict(checkpoint.state_dict(), strict=True)
         print("Loaded student weights from module checkpoint")
-        return True
+        return
     if isinstance(checkpoint, dict):
         student.load_state_dict(checkpoint, strict=True)
         print("Loaded student weights from state dict")
-        return True
+        return
     raise ValueError(f"Unsupported student checkpoint format: {ckpt_path}")
+
+
+def freeze_student(student: nn.Module) -> None:
+    """Keep the validation-selected distilled Student fixed downstream."""
+
+    for param in student.parameters():
+        param.requires_grad_(False)
+    student.eval()
 
 
 def select_samples(samples: list, max_samples: int | None, split_name: str) -> list:
@@ -626,13 +621,10 @@ def parse_args():
     parser.add_argument("--neighbor-vy-col", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=180)
-    parser.add_argument("--phase1-epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--film-lr", type=float, default=1.5e-4)
-    parser.add_argument("--student-lr", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--film-weight-decay", type=float, default=0.0)
-    parser.add_argument("--student-weight-decay", type=float, default=0.0)
     parser.add_argument("--latent-dim", type=int, default=64)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--transformer-dim", type=int, default=128)
@@ -664,7 +656,6 @@ def parse_args():
     parser.add_argument("--eps", type=float, default=1e-6)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--no-student", dest="use_student", action="store_false")
-    parser.add_argument("--require-student-ckpt", action="store_true")
     parser.set_defaults(use_student=True)
     args = parser.parse_args()
 
@@ -766,13 +757,11 @@ def main():
     student = None
     if args.use_student:
         student = StrategyStudent(in_dim=args.hist_dim, hid_dim=128, out_dim=llm_dim).to(device)
-        load_student_checkpoint(student, args.student_ckpt, device, args.require_student_ckpt)
-        for param in student.parameters():
-            param.requires_grad_(False)
-        student.eval()
+        load_student_checkpoint(student, args.student_ckpt, device)
+        freeze_student(student)
 
     model = JointLLMCVAETransformerResidual(llm_dim=llm_dim, output_dim=output_dim, args=args).to(device)
-    optimizer = build_optimizer(model, args, phase2=False)
+    optimizer = build_optimizer(model, args)
     mse = nn.MSELoss()
 
     run_config_path = args.out_dir / "run_config.json"
@@ -807,6 +796,7 @@ def main():
             "scaler_path": str(scaler_path),
             "selection_split": "validation",
             "selection_metric": "ADE",
+            "student_frozen_during_trajectory_training": bool(args.use_student),
         }
     )
     for key, value in list(run_config.items()):
@@ -836,17 +826,8 @@ def main():
     metrics_history = []
 
     for epoch in range(1, args.epochs + 1):
-        if args.use_student and epoch == args.phase1_epochs + 1:
-            print("Entering phase 2: unfreezing StrategyStudent")
-            for param in student.parameters():
-                param.requires_grad_(True)
-            student.train()
-            optimizer = build_optimizer(model, args, student=student, phase2=True)
-
-        if args.use_student and epoch <= args.phase1_epochs:
+        if args.use_student:
             student.eval()
-        elif args.use_student:
-            student.train()
         model.train()
 
         train_loss = 0.0
@@ -862,10 +843,7 @@ def main():
             target_norm = target_norm.to(device)
 
             if args.use_student:
-                if epoch <= args.phase1_epochs:
-                    with torch.no_grad():
-                        strategy_in = student(hist_norm)
-                else:
+                with torch.no_grad():
                     strategy_in = student(hist_norm)
             else:
                 strategy_in = llm_offline
@@ -884,8 +862,6 @@ def main():
             loss = loss_pred + args.alpha_recon * loss_recon + args.beta_kl * loss_kl
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            if args.use_student and epoch > args.phase1_epochs:
-                torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=5.0)
             optimizer.step()
 
             batch_size = hist_norm.size(0)
@@ -917,7 +893,7 @@ def main():
         val_fde_det = val_metrics["fde_det"]
         val_film_strength = val_metrics["film_strength"]
 
-        phase_flag = "phase1" if epoch <= args.phase1_epochs else "phase2"
+        phase_flag = "frozen_student" if args.use_student else "teacher_vector"
         print(
             f"Epoch {epoch:03d} [{phase_flag}] | "
             f"Train: total={train_loss:.6f} predMSE={train_pred_mse:.6f} "
@@ -968,6 +944,7 @@ def main():
                 "film_strength_val": val_film_strength,
                 "scaler_path": str(scaler_path),
                 "use_student": args.use_student,
+                "student_frozen": bool(args.use_student),
                 "phase": phase_flag,
             }
             if args.use_student:
@@ -990,6 +967,7 @@ def main():
                 "film_strength_val": val_film_strength,
                 "scaler_path": str(scaler_path),
                 "use_student": args.use_student,
+                "student_frozen": bool(args.use_student),
                 "phase": phase_flag,
             }
             if args.use_student:
@@ -1018,6 +996,7 @@ def main():
         if "student" not in best_checkpoint:
             raise KeyError("Validation-selected checkpoint does not contain student weights")
         student.load_state_dict(best_checkpoint["student"], strict=True)
+        freeze_student(student)
 
     print("Loading the test set for one final evaluation")
     if not args.test_mat.exists():

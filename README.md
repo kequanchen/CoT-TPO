@@ -92,6 +92,11 @@ python scripts/generate_llm_teacher.py \
   --data-path data/train_dataset.mat \
   --data-key train_data \
   --all-samples \
+  --model qwen3-235b-a22b \
+  --enable-thinking \
+  --stream \
+  --temperature 0.3 \
+  --max-tokens 2000 \
   --vehicle-length VEHICLE_LENGTH_METERS \
   --vehicle-width VEHICLE_WIDTH_METERS \
   --ego-x-col EGO_X_COL \
@@ -132,6 +137,12 @@ python scripts/generate_llm_teacher.py \
   --neighbor-acc-col NEIGHBOR_ACC_COL \
   --output-dir outputs/llm_cot/train
 ```
+
+The paper teacher is Qwen3-235B-A22B with native thinking enabled. The
+OpenAI-compatible call uses streaming output because this Qwen3 model requires
+streaming in thinking mode. The script collects the streamed reasoning content
+separately and parses the final JSON response. Use `--disable-thinking` only
+for the non-thinking ablation.
 
 On PowerShell, set the variables with
 `$env:LLM_API_KEY="YOUR_API_KEY"` and
@@ -193,9 +204,13 @@ python scripts/train_cot_tp_film.py \
   --test-vector-dir doc/testinput \
   --student-ckpt outputs/student_mlp/strategy_student_distill.pth \
   --out-dir outputs/cot_tp_film \
-  --eval-repeats 20 \
-  --require-student-ckpt
+  --eval-repeats 20
 ```
+
+The validation-selected distilled Student checkpoint is required and remains
+frozen throughout trajectory predictor training and evaluation. Its parameters
+are not included in the trajectory optimizer and are not updated by the
+trajectory prediction loss.
 
 The internal `--num-samples` setting controls the number of stochastic CVAE
 candidate trajectories averaged to form the baseline trajectory in Eq. (9).
