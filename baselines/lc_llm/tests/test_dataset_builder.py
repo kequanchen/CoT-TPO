@@ -75,6 +75,9 @@ class DatasetBuilderTests(unittest.TestCase):
         parsed = parse_lc_llm_output(record["answer"])
         self.assertEqual(parsed.intention, 1)
         self.assertEqual(parsed.trajectory.shape, (50, 2))
+        validation_record = build_supervised_record(sample, source_split="validation")
+        self.assertEqual(validation_record["source_split"], "validation")
+        self.assertEqual(validation_record["event_id"], record["event_id"])
         with self.assertRaises(ValueError):
             build_supervised_record(sample, source_split="test")
 

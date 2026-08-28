@@ -97,6 +97,36 @@ class SFTTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "duplicate sample_id"):
                 load_jsonl_records(path)
 
+    def test_jsonl_loader_enforces_validation_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "validation.jsonl"
+            row = {
+                "sample_id": "validation:1",
+                "event_id": "crash-7",
+                "source_split": "validation",
+                "system_prompt": "s",
+                "user_prompt": "u",
+                "answer": "a",
+            }
+            path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            loaded = load_jsonl_records(
+                path,
+                expected_source_split="validation",
+                require_event_id=True,
+            )
+            self.assertEqual(loaded[0].event_id, "crash-7")
+            with self.assertRaisesRegex(ValueError, "expected 'train'"):
+                load_jsonl_records(path, expected_source_split="train")
+
+            del row["event_id"]
+            path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "event_id is required"):
+                load_jsonl_records(
+                    path,
+                    expected_source_split="validation",
+                    require_event_id=True,
+                )
+
     def test_collator_masks_padding(self) -> None:
         try:
             import torch  # noqa: F401

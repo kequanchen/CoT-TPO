@@ -39,7 +39,10 @@ def convert_mat_value(x):
 
 def load_mat_samples(mat_path: Path, key: str | None = None) -> list:
     mat = sio.loadmat(str(mat_path), struct_as_record=False, squeeze_me=True)
-    if key is not None and key in mat:
+    if key is not None:
+        if key not in mat:
+            data_keys = [name for name in mat.keys() if not name.startswith("__")]
+            raise KeyError(f"Key {key!r} not found in {mat_path}. Available keys={data_keys}")
         raw_data = mat[key]
     else:
         data_keys = [name for name in mat.keys() if not name.startswith("__")]
@@ -143,11 +146,28 @@ def load_llm_vectors(vector_dir: Path) -> tuple[dict[int, np.ndarray], int]:
     if not vectors_path.exists():
         raise FileNotFoundError(f"Missing {vectors_path}")
 
-    ids = np.load(str(ids_path)).astype(np.int32)
+    ids = np.asarray(np.load(str(ids_path)), dtype=np.int64).reshape(-1)
     vectors = np.load(str(vectors_path)).astype(np.float32)
+    if vectors.ndim != 2:
+        raise ValueError(f"Strategy vectors must be a 2D array, got shape={vectors.shape}")
     if len(ids) != vectors.shape[0]:
         raise ValueError(f"Vector id mismatch in {vector_dir}: ids={len(ids)}, rows={vectors.shape[0]}")
+    if len(np.unique(ids)) != len(ids):
+        raise ValueError(f"Strategy-vector IDs must be unique under {vector_dir}")
     return {int(ids[i]): vectors[i] for i in range(len(ids))}, int(vectors.shape[1])
+
+
+def require_vector_coverage(
+    id_to_vector: dict[int, np.ndarray], sample_count: int, split_name: str
+) -> None:
+    """Require one exact, zero-based vector ID for every MAT row in use."""
+
+    missing = sorted(set(range(sample_count)) - set(id_to_vector))
+    if missing:
+        preview = ", ".join(str(value) for value in missing[:10])
+        raise ValueError(
+            f"Missing {split_name} strategy vectors for zero-based MAT indices: {preview}"
+        )
 
 
 class LLMJointDataset(Dataset):
@@ -170,12 +190,12 @@ class LLMJointDataset(Dataset):
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        sample_id = int(sample.get("sample_id", self.start_id_fallback + idx))
+        sample_id = self.start_id_fallback + idx
         hist = build_history(sample, self.args)
         target = build_target(sample, self.args)
         llm_vector = self.id_to_vector.get(sample_id)
         if llm_vector is None:
-            llm_vector = np.zeros((self.llm_dim,), dtype=np.float32)
+            raise KeyError(f"No strategy vector found for zero-based MAT index {sample_id}")
         return (
             torch.tensor(hist, dtype=torch.float32),
             torch.tensor(llm_vector, dtype=torch.float32),
@@ -442,6 +462,78 @@ def write_json(path: Path, payload: dict) -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
+@torch.no_grad()
+def evaluate_trajectory_model(
+    model: nn.Module,
+    student: nn.Module | None,
+    data_loader: DataLoader,
+    device: torch.device,
+    mse: nn.Module,
+    target_mean: torch.Tensor,
+    target_std: torch.Tensor,
+    args,
+) -> dict[str, float]:
+    model.eval()
+    if student is not None:
+        student.eval()
+
+    total_mse = 0.0
+    total_ade = 0.0
+    total_fde = 0.0
+    total_film_strength = 0.0
+    total_seen = 0
+
+    for hist_norm, llm_offline, target_norm, _ in data_loader:
+        hist_norm = hist_norm.to(device)
+        llm_offline = llm_offline.to(device)
+        target_norm = target_norm.to(device)
+
+        strategy_in = student(hist_norm) if student is not None else llm_offline
+        target = denormalize_target(target_norm, target_mean, target_std)
+
+        repeat_mse = 0.0
+        repeat_ade = 0.0
+        repeat_fde = 0.0
+        repeat_film_strength = 0.0
+        for _ in range(args.eval_repeats):
+            final_norm, _, _, _, film_strength = model(
+                hist_norm,
+                strategy_in,
+                num_samples=args.num_samples,
+                strategy_dropout_p=0.0,
+            )
+            mse_loss = mse(final_norm, target_norm)
+            final = denormalize_target(final_norm, target_mean, target_std)
+            ade_det, fde_det = ade_fde_from_flat(final, target, pred_len=args.pred_len)
+            repeat_mse += float(mse_loss)
+            repeat_ade += float(ade_det)
+            repeat_fde += float(fde_det)
+            repeat_film_strength += float(film_strength.detach())
+
+        repeat_mse /= args.eval_repeats
+        repeat_ade /= args.eval_repeats
+        repeat_fde /= args.eval_repeats
+        repeat_film_strength /= args.eval_repeats
+
+        batch_size = hist_norm.size(0)
+        total_seen += batch_size
+        total_mse += repeat_mse * batch_size
+        total_ade += repeat_ade * batch_size
+        total_fde += repeat_fde * batch_size
+        total_film_strength += repeat_film_strength * batch_size
+
+    if total_seen == 0:
+        raise ValueError("Evaluation set contains no finite samples")
+
+    return {
+        "mse_norm": total_mse / total_seen,
+        "ade_det": total_ade / total_seen,
+        "fde_det": total_fde / total_seen,
+        "film_strength": total_film_strength / total_seen,
+        "num_samples": total_seen,
+    }
+
+
 def build_optimizer(model: nn.Module, args, student: nn.Module | None = None, phase2: bool = False):
     film_params = []
     base_params = []
@@ -507,12 +599,18 @@ def select_samples(samples: list, max_samples: int | None, split_name: str) -> l
 def parse_args():
     parser = argparse.ArgumentParser(description="Train the CoT-TP FiLM trajectory prediction model.")
     parser.add_argument("--train-mat", type=Path, default=Path("data/train_dataset1to1.mat"))
+    parser.add_argument("--val-mat", type=Path, default=Path("data/validation_dataset1to1.mat"))
     parser.add_argument("--test-mat", type=Path, default=Path("data/test_dataset1to1.mat"))
+    parser.add_argument("--train-key", type=str, default="train_data")
+    parser.add_argument("--val-key", type=str, default="validation_data")
+    parser.add_argument("--test-key", type=str, default="test_data")
     parser.add_argument("--train-vector-dir", type=Path, default=Path("doc/traininput"))
+    parser.add_argument("--val-vector-dir", type=Path, default=Path("doc/validationinput"))
     parser.add_argument("--test-vector-dir", type=Path, default=Path("doc/testinput"))
     parser.add_argument("--student-ckpt", type=Path, default=Path("checkpoints/strategy_student_distill.pth"))
     parser.add_argument("--out-dir", type=Path, default=Path("outputs/cot_tp_film"))
     parser.add_argument("--max-train-samples", type=int, default=None)
+    parser.add_argument("--max-val-samples", type=int, default=None)
     parser.add_argument("--max-test-samples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--hist-len", type=int, default=10)
@@ -571,8 +669,10 @@ def parse_args():
     args = parser.parse_args()
 
     args.train_mat = resolve_path(args.train_mat)
+    args.val_mat = resolve_path(args.val_mat)
     args.test_mat = resolve_path(args.test_mat)
     args.train_vector_dir = resolve_path(args.train_vector_dir)
+    args.val_vector_dir = resolve_path(args.val_vector_dir)
     args.test_vector_dir = resolve_path(args.test_vector_dir)
     args.student_ckpt = resolve_path(args.student_ckpt)
     args.out_dir = resolve_path(args.out_dir)
@@ -580,6 +680,12 @@ def parse_args():
         raise ValueError("--num-samples must be positive")
     if args.eval_repeats <= 0:
         raise ValueError("--eval-repeats must be positive")
+    if args.epochs <= 0:
+        raise ValueError("--epochs must be positive")
+    if len({args.train_mat, args.val_mat, args.test_mat}) != 3:
+        raise ValueError("Training, validation, and test MAT paths must be distinct")
+    if len({args.train_vector_dir, args.val_vector_dir, args.test_vector_dir}) != 3:
+        raise ValueError("Training, validation, and test vector directories must be distinct")
     return args
 
 
@@ -591,38 +697,40 @@ def main():
 
     if not args.train_mat.exists():
         raise FileNotFoundError(f"Train MAT not found: {args.train_mat}")
-    if not args.test_mat.exists():
-        raise FileNotFoundError(f"Test MAT not found: {args.test_mat}")
+    if not args.val_mat.exists():
+        raise FileNotFoundError(f"Validation MAT not found: {args.val_mat}")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     scaler_path = args.out_dir / "scaler_llm_cvae.npz"
 
     print("Loading MATLAB training samples")
-    all_train_samples = load_mat_samples(args.train_mat, "train_data")
+    all_train_samples = load_mat_samples(args.train_mat, args.train_key)
     train_samples = select_samples(all_train_samples, args.max_train_samples, "train")
     print(f"Training samples: available={len(all_train_samples)} used={len(train_samples)}")
 
-    print("Loading MATLAB test samples")
-    all_test_samples = load_mat_samples(args.test_mat, "test_data")
-    test_samples = select_samples(all_test_samples, args.max_test_samples, "test")
-    print(f"Test samples: available={len(all_test_samples)} used={len(test_samples)}")
+    print("Loading MATLAB validation samples")
+    all_val_samples = load_mat_samples(args.val_mat, args.val_key)
+    val_samples = select_samples(all_val_samples, args.max_val_samples, "validation")
+    print(f"Validation samples: available={len(all_val_samples)} used={len(val_samples)}")
 
     print("Loading strategy vectors")
     id_to_train_vector, llm_dim_train = load_llm_vectors(args.train_vector_dir)
-    id_to_test_vector, llm_dim_test = load_llm_vectors(args.test_vector_dir)
-    if llm_dim_train != llm_dim_test:
-        raise ValueError(f"Strategy vector dimension mismatch: train={llm_dim_train}, test={llm_dim_test}")
+    id_to_val_vector, llm_dim_val = load_llm_vectors(args.val_vector_dir)
+    if llm_dim_train != llm_dim_val:
+        raise ValueError(f"Strategy vector dimension mismatch: train={llm_dim_train}, val={llm_dim_val}")
     llm_dim = llm_dim_train
+    require_vector_coverage(id_to_train_vector, len(train_samples), "training")
+    require_vector_coverage(id_to_val_vector, len(val_samples), "validation")
 
     train_raw = LLMJointDataset(train_samples, id_to_train_vector, llm_dim, args)
-    test_raw = LLMJointDataset(test_samples, id_to_test_vector, llm_dim, args)
+    val_raw = LLMJointDataset(val_samples, id_to_val_vector, llm_dim, args)
 
     good_train, bad_train = finite_indices(train_raw)
-    good_test, bad_test = finite_indices(test_raw)
+    good_val, bad_val = finite_indices(val_raw)
     print(f"Finite training samples: good={len(good_train)} bad={len(bad_train)}")
-    print(f"Finite test samples: good={len(good_test)} bad={len(bad_test)}")
-    if len(good_train) == 0 or len(good_test) == 0:
-        raise ValueError("No finite samples are available for training or evaluation")
+    print(f"Finite validation samples: good={len(good_val)} bad={len(bad_val)}")
+    if len(good_train) == 0 or len(good_val) == 0:
+        raise ValueError("No finite samples are available for training or validation")
 
     hist_mean, hist_std, target_mean, target_std = compute_mean_std(
         train_raw,
@@ -640,7 +748,7 @@ def main():
     )
 
     train_dataset = NormalizedWrapper(train_raw, hist_mean, hist_std, target_mean, target_std)
-    test_dataset = NormalizedWrapper(test_raw, hist_mean, hist_std, target_mean, target_std)
+    val_dataset = NormalizedWrapper(val_raw, hist_mean, hist_std, target_mean, target_std)
 
     train_loader = DataLoader(
         Subset(train_dataset, good_train),
@@ -648,8 +756,8 @@ def main():
         shuffle=True,
         drop_last=False,
     )
-    test_loader = DataLoader(
-        Subset(test_dataset, good_test),
+    val_loader = DataLoader(
+        Subset(val_dataset, good_val),
         batch_size=args.batch_size,
         shuffle=False,
         drop_last=False,
@@ -671,9 +779,17 @@ def main():
     metrics_csv_path = args.out_dir / "metrics_history.csv"
     metrics_jsonl_path = args.out_dir / "metrics_history.jsonl"
     best_metrics_path = args.out_dir / "best_metrics.json"
+    final_test_metrics_path = args.out_dir / "final_test_metrics.json"
     final_summary_path = args.out_dir / "final_summary.json"
 
-    for path in [metrics_csv_path, metrics_jsonl_path, best_metrics_path, final_summary_path, args.out_dir / "metrics_history.json"]:
+    for path in [
+        metrics_csv_path,
+        metrics_jsonl_path,
+        best_metrics_path,
+        final_test_metrics_path,
+        final_summary_path,
+        args.out_dir / "metrics_history.json",
+    ]:
         if path.exists():
             path.unlink()
 
@@ -682,13 +798,15 @@ def main():
         {
             "train_samples_available": len(all_train_samples),
             "train_samples_used": len(train_samples),
-            "test_samples_available": len(all_test_samples),
-            "test_samples_used": len(test_samples),
+            "val_samples_available": len(all_val_samples),
+            "val_samples_used": len(val_samples),
             "finite_train_samples": len(good_train),
-            "finite_test_samples": len(good_test),
+            "finite_val_samples": len(good_val),
             "llm_dim": llm_dim,
             "output_dim": output_dim,
             "scaler_path": str(scaler_path),
+            "selection_split": "validation",
+            "selection_metric": "ADE",
         }
     )
     for key, value in list(run_config.items()):
@@ -704,16 +822,17 @@ def main():
         "train_recon_mse",
         "train_kl",
         "train_film_strength",
-        "test_mse_norm",
-        "test_ade_det",
-        "test_fde_det",
-        "test_film_strength",
-        "best_ade_so_far",
+        "val_mse_norm",
+        "val_ade_det",
+        "val_fde_det",
+        "val_film_strength",
+        "best_val_ade_so_far",
         "is_best",
     ]
 
-    best_metric = float("inf")
+    best_val_metric = float("inf")
     best_record = None
+    best_path = args.out_dir / "best_llm_cvae_residual_det.pth"
     metrics_history = []
 
     for epoch in range(1, args.epochs + 1):
@@ -783,69 +902,20 @@ def main():
         train_kl /= n_train
         train_film_strength = train_film_sum / n_train
 
-        model.eval()
-        if args.use_student:
-            student.eval()
-
-        test_mse = 0.0
-        test_ade_det = 0.0
-        test_fde_det = 0.0
-        test_film_sum = 0.0
-        n_test = 0
-
-        with torch.no_grad():
-            for hist_norm, llm_offline, target_norm, _ in test_loader:
-                hist_norm = hist_norm.to(device)
-                llm_offline = llm_offline.to(device)
-                target_norm = target_norm.to(device)
-
-                if args.use_student:
-                    strategy_in = student(hist_norm)
-                else:
-                    strategy_in = llm_offline
-
-                target = denormalize_target(target_norm, target_mean, target_std)
-
-                # Each repeat is a complete stochastic prediction. Within each
-                # repeat, ``num_samples`` CVAE candidates are averaged as in
-                # Eq. (9) before the residual trajectory is produced.
-                repeat_mse = 0.0
-                repeat_ade = 0.0
-                repeat_fde = 0.0
-                repeat_film_strength = 0.0
-                for _ in range(args.eval_repeats):
-                    final_norm, _, _, _, film_strength = model(
-                        hist_norm,
-                        strategy_in,
-                        num_samples=args.num_samples,
-                        strategy_dropout_p=0.0,
-                    )
-                    mse_loss = mse(final_norm, target_norm)
-                    final = denormalize_target(final_norm, target_mean, target_std)
-                    ade_det, fde_det = ade_fde_from_flat(
-                        final, target, pred_len=args.pred_len
-                    )
-                    repeat_mse += float(mse_loss)
-                    repeat_ade += float(ade_det)
-                    repeat_fde += float(fde_det)
-                    repeat_film_strength += float(film_strength.detach())
-
-                repeat_mse /= args.eval_repeats
-                repeat_ade /= args.eval_repeats
-                repeat_fde /= args.eval_repeats
-                repeat_film_strength /= args.eval_repeats
-
-                batch_size = hist_norm.size(0)
-                n_test += batch_size
-                test_mse += repeat_mse * batch_size
-                test_ade_det += repeat_ade * batch_size
-                test_fde_det += repeat_fde * batch_size
-                test_film_sum += repeat_film_strength * batch_size
-
-        test_mse /= n_test
-        test_ade_det /= n_test
-        test_fde_det /= n_test
-        test_film_strength = test_film_sum / n_test
+        val_metrics = evaluate_trajectory_model(
+            model,
+            student,
+            val_loader,
+            device,
+            mse,
+            target_mean,
+            target_std,
+            args,
+        )
+        val_mse = val_metrics["mse_norm"]
+        val_ade_det = val_metrics["ade_det"]
+        val_fde_det = val_metrics["fde_det"]
+        val_film_strength = val_metrics["film_strength"]
 
         phase_flag = "phase1" if epoch <= args.phase1_epochs else "phase2"
         print(
@@ -853,11 +923,11 @@ def main():
             f"Train: total={train_loss:.6f} predMSE={train_pred_mse:.6f} "
             f"reconMSE={train_recon_mse:.6f} kl={train_kl:.6f} "
             f"film_strength={train_film_strength:.3f} | "
-            f"Test: MSE(norm)={test_mse:.6f} ADE={test_ade_det:.6f} "
-            f"FDE={test_fde_det:.6f} film_strength={test_film_strength:.3f}"
+            f"Validation: MSE(norm)={val_mse:.6f} ADE={val_ade_det:.6f} "
+            f"FDE={val_fde_det:.6f} film_strength={val_film_strength:.3f}"
         )
 
-        is_best = test_ade_det < best_metric
+        is_best = val_ade_det < best_val_metric
         record = {
             "epoch": epoch,
             "phase": phase_flag,
@@ -866,11 +936,11 @@ def main():
             "train_recon_mse": float(train_recon_mse),
             "train_kl": float(train_kl),
             "train_film_strength": float(train_film_strength),
-            "test_mse_norm": float(test_mse),
-            "test_ade_det": float(test_ade_det),
-            "test_fde_det": float(test_fde_det),
-            "test_film_strength": float(test_film_strength),
-            "best_ade_so_far": float(min(best_metric, test_ade_det)),
+            "val_mse_norm": float(val_mse),
+            "val_ade_det": float(val_ade_det),
+            "val_fde_det": float(val_fde_det),
+            "val_film_strength": float(val_film_strength),
+            "best_val_ade_so_far": float(min(best_val_metric, val_ade_det)),
             "is_best": bool(is_best),
         }
         metrics_history.append(record)
@@ -891,9 +961,11 @@ def main():
                 "model": model.state_dict(),
                 "llm_dim": llm_dim,
                 "output_dim": output_dim,
-                "metric_ADE_det": test_ade_det,
-                "metric_FDE_det": test_fde_det,
-                "film_strength_test": test_film_strength,
+                "selection_split": "validation",
+                "metric_ADE_det": val_ade_det,
+                "metric_FDE_det": val_fde_det,
+                "val_mse_norm": val_mse,
+                "film_strength_val": val_film_strength,
                 "scaler_path": str(scaler_path),
                 "use_student": args.use_student,
                 "phase": phase_flag,
@@ -903,17 +975,19 @@ def main():
             torch.save(checkpoint, checkpoint_path)
 
         if is_best:
-            best_metric = test_ade_det
+            best_val_metric = val_ade_det
             best_record = record
-            best_path = args.out_dir / "best_llm_cvae_residual_det.pth"
             checkpoint = {
                 "epoch": epoch,
                 "model": model.state_dict(),
                 "llm_dim": llm_dim,
                 "output_dim": output_dim,
-                "best_metric_ADE_det": best_metric,
-                "metric_FDE_det": test_fde_det,
-                "film_strength_test": test_film_strength,
+                "selection_split": "validation",
+                "best_metric_ADE_det": best_val_metric,
+                "best_val_ADE_det": best_val_metric,
+                "val_FDE_det": val_fde_det,
+                "val_mse_norm": val_mse,
+                "film_strength_val": val_film_strength,
                 "scaler_path": str(scaler_path),
                 "use_student": args.use_student,
                 "phase": phase_flag,
@@ -925,14 +999,90 @@ def main():
                 best_metrics_path,
                 {
                     "best_epoch": epoch,
-                    "best_ade_det": float(best_metric),
-                    "best_fde_det": float(test_fde_det),
-                    "best_test_mse_norm": float(test_mse),
-                    "best_film_strength_test": float(test_film_strength),
+                    "selection_split": "validation",
+                    "best_val_ade_det": float(best_val_metric),
+                    "best_val_fde_det": float(val_fde_det),
+                    "best_val_mse_norm": float(val_mse),
+                    "best_film_strength_val": float(val_film_strength),
                     "best_model_path": str(best_path),
                     "record": best_record,
                 },
             )
+
+    if best_record is None or not best_path.exists():
+        raise RuntimeError("Training finished without a validation-selected checkpoint")
+
+    best_checkpoint = torch.load(str(best_path), map_location=device, weights_only=False)
+    model.load_state_dict(best_checkpoint["model"], strict=True)
+    if args.use_student:
+        if "student" not in best_checkpoint:
+            raise KeyError("Validation-selected checkpoint does not contain student weights")
+        student.load_state_dict(best_checkpoint["student"], strict=True)
+
+    print("Loading the test set for one final evaluation")
+    if not args.test_mat.exists():
+        raise FileNotFoundError(f"Test MAT not found: {args.test_mat}")
+    all_test_samples = load_mat_samples(args.test_mat, args.test_key)
+    test_samples = select_samples(all_test_samples, args.max_test_samples, "test")
+    print(f"Test samples: available={len(all_test_samples)} used={len(test_samples)}")
+
+    id_to_test_vector, llm_dim_test = load_llm_vectors(args.test_vector_dir)
+    if llm_dim_test != llm_dim:
+        raise ValueError(f"Strategy vector dimension mismatch: train={llm_dim}, test={llm_dim_test}")
+    require_vector_coverage(id_to_test_vector, len(test_samples), "test")
+
+    test_raw = LLMJointDataset(test_samples, id_to_test_vector, llm_dim, args)
+    good_test, bad_test = finite_indices(test_raw)
+    print(f"Finite test samples: good={len(good_test)} bad={len(bad_test)}")
+    if len(good_test) == 0:
+        raise ValueError("No finite samples are available for final test evaluation")
+
+    test_dataset = NormalizedWrapper(test_raw, hist_mean, hist_std, target_mean, target_std)
+    test_loader = DataLoader(
+        Subset(test_dataset, good_test),
+        batch_size=args.batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
+    set_seed(args.seed)
+    test_metrics = evaluate_trajectory_model(
+        model,
+        student,
+        test_loader,
+        device,
+        mse,
+        target_mean,
+        target_std,
+        args,
+    )
+    final_test_payload = {
+        "checkpoint": str(best_path),
+        "selected_epoch": best_record["epoch"],
+        "selection_split": "validation",
+        "selection_metric": "validation_ADE",
+        "evaluation_seed": args.seed,
+        "test_evaluations": 1,
+        "test_samples_available": len(all_test_samples),
+        "test_samples_used": len(test_samples),
+        "finite_test_samples": len(good_test),
+        "bad_test_samples": len(bad_test),
+        "test_mse_norm": float(test_metrics["mse_norm"]),
+        "test_ade_det": float(test_metrics["ade_det"]),
+        "test_fde_det": float(test_metrics["fde_det"]),
+        "test_film_strength": float(test_metrics["film_strength"]),
+    }
+    write_json(final_test_metrics_path, final_test_payload)
+
+    run_config.update(
+        {
+            "test_samples_available": len(all_test_samples),
+            "test_samples_used": len(test_samples),
+            "finite_test_samples": len(good_test),
+            "bad_test_samples": len(bad_test),
+            "test_evaluations": 1,
+        }
+    )
+    write_json(run_config_path, run_config)
 
     write_json(
         final_summary_path,
@@ -940,14 +1090,22 @@ def main():
             "num_epochs": args.epochs,
             "best_record": best_record,
             "last_record": metrics_history[-1] if metrics_history else None,
+            "final_test_metrics": final_test_payload,
             "metrics_csv": str(metrics_csv_path),
             "metrics_jsonl": str(metrics_jsonl_path),
             "best_metrics": str(best_metrics_path),
-            "best_model_path": str(args.out_dir / "best_llm_cvae_residual_det.pth"),
+            "best_model_path": str(best_path),
+            "final_test_metrics_path": str(final_test_metrics_path),
         },
     )
     write_json(args.out_dir / "metrics_history.json", {"records": metrics_history})
     print(f"Metrics saved to {metrics_csv_path}")
+    print(
+        f"Final test | MSE(norm)={test_metrics['mse_norm']:.6f} "
+        f"ADE={test_metrics['ade_det']:.6f} FDE={test_metrics['fde_det']:.6f} "
+        f"film_strength={test_metrics['film_strength']:.3f}"
+    )
+    print(f"Final test metrics saved to {final_test_metrics_path}")
     print(f"Final summary saved to {final_summary_path}")
 
 

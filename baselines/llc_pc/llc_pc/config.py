@@ -137,7 +137,7 @@ def load_config(path: Union[str, Path]) -> dict[str, Any]:
     config = copy.deepcopy(dict(payload))
     _validate_config_values(config)
     baseline_root = Path(__file__).resolve().parents[1]
-    for key in ("train_mat", "test_mat"):
+    for key in ("train_mat", "validation_mat", "test_mat"):
         config["data"][key] = _resolve_public_path(config["data"][key], baseline_root)
     for key, value in list(config["paths"].items()):
         config["paths"][key] = _resolve_public_path(value, baseline_root)
@@ -171,13 +171,13 @@ def load_configured_split(
     """Load one configured split while keeping future access explicit.
 
     Prompt and retrieval code should always pass ``include_future=False``.
-    Intention-point fitting and supervised training are the only expected
-    callers that pass ``True``.
+    Intention-point fitting, supervised training, validation, and final test
+    evaluation are the expected callers that pass ``True``.
     """
 
     normalized = str(split).strip().lower()
-    if normalized not in {"train", "test"}:
-        raise ValueError("split must be 'train' or 'test'")
+    if normalized not in {"train", "validation", "test"}:
+        raise ValueError("split must be 'train', 'validation', or 'test'")
     from .data_adapter import load_mat_samples
 
     path = str(config["data"][f"{normalized}_mat"])
@@ -213,6 +213,12 @@ def _resolve_public_path(value: Any, root: Path) -> str:
 
 def _validate_config_values(config: Mapping[str, Any]) -> None:
     data = config["data"]
+    for split in ("train", "validation", "test"):
+        for suffix in ("mat", "key"):
+            field = f"{split}_{suffix}"
+            value = data.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"data.{field} must be a non-empty string")
     if int(data.get("history_steps", 0)) <= 0:
         raise ValueError("data.history_steps must be positive")
     if int(data.get("future_steps", 0)) <= 0:

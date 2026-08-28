@@ -136,10 +136,17 @@ In the local file, replace only the private input placeholders:
 {
   "data": {
     "train_mat": "<PATH_TO_TRAIN_MAT>",
+    "validation_mat": "<PATH_TO_VALIDATION_MAT>",
     "test_mat": "<PATH_TO_TEST_MAT>"
   }
 }
 ```
+
+The three files must be prepared as mutually exclusive, event-level splits
+before sliding-window extraction. For the paper-aligned post-crash data, the
+50 crash episodes are partitioned 70%/10%/20% into 35 training, 5 validation,
+and 10 test episodes. Do not create validation samples by randomly splitting
+overlapping windows, and do not point the validation path at the test file.
 
 Do not replace the public example with real paths. Generated artifacts are
 written below the ignored `outputs/` directory by default.
@@ -214,16 +221,26 @@ python scripts/train.py \
   --config configs/post_crash_lc.local.json
 ```
 
-### 5. Evaluate
+The training command loads only the training and validation splits. It queries
+the frozen training-only context index for both splits, evaluates the complete
+validation set after every epoch with gradients disabled, and writes
+`checkpoints/best.pt` according to the lowest validation loss. It also writes
+`checkpoints/last.pt` and `checkpoints/training_history.json`. The test split is
+not loaded by `train.py`.
+
+### 5. Evaluate the Frozen Best Checkpoint on Test
 
 ```bash
 python scripts/evaluate.py \
   --config configs/post_crash_lc.local.json \
-  --checkpoint <PATH_TO_LLC_PC_CHECKPOINT>
+  --checkpoint outputs/llc_pc/checkpoints/best.pt
 ```
 
 The evaluator reports ADE/FDE for the highest-probability trajectory among the
-generated modes over the configured prediction horizons.
+generated modes over the configured prediction horizons. Run this test
+evaluation only after checkpoint selection and all model and hyperparameter
+choices have been fixed from training and validation results. Do not compare
+multiple checkpoints on the test set.
 
 ## Leakage Controls
 
@@ -236,7 +253,11 @@ The following constraints are part of the baseline definition:
 3. Intention-point clustering uses training endpoints only.
 4. A sample may be excluded from retrieving itself, and the default configuration
    also excludes contexts from the same event when identifiers are available.
-5. Test future trajectories are read only after prediction to calculate metrics.
+5. Validation future trajectories are used only for the supervised loss that
+   selects `best.pt`; validation does not update model parameters.
+6. `train.py` never loads the test split. Test labels never enter model inputs
+   and are used only by the separate `evaluate.py` command to calculate final
+   metrics for the already selected `best.pt` checkpoint.
 
 These rules are more important than matching a particular local directory
 layout. Do not weaken them when adapting the loader to another private dataset.

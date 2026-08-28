@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -26,7 +27,9 @@ from llc_pc.tensorizer import TensorizedBatch, standardizer_path_for_index  # no
 from llc_pc.training import (  # noqa: E402
     LLCPCArrayDataset,
     build_model,
+    evaluate_loss_epoch,
     load_model_checkpoint,
+    make_loader,
     model_inputs,
     retrieve_semantic_contexts,
     save_checkpoint,
@@ -34,6 +37,47 @@ from llc_pc.training import (  # noqa: E402
 
 
 class TrainingHelpersTest(unittest.TestCase):
+    def test_validation_loss_uses_correct_component_denominators(self) -> None:
+        class DummyModel(torch.nn.Module):
+            def forward(self, **_kwargs):
+                return {}
+
+        loader = [
+            {
+                "future": torch.zeros((1, 2, 2)),
+                "future_valid_mask": torch.tensor([[True, False]]),
+            },
+            {
+                "future": torch.zeros((2, 2, 2)),
+                "future_valid_mask": torch.ones((2, 2), dtype=torch.bool),
+            },
+        ]
+        losses = [
+            {
+                "loss": torch.tensor(12.0),
+                "regression_loss": torch.tensor(2.0),
+                "classification_loss": torch.tensor(10.0),
+            },
+            {
+                "loss": torch.tensor(24.0),
+                "regression_loss": torch.tensor(4.0),
+                "classification_loss": torch.tensor(20.0),
+            },
+        ]
+        with (
+            mock.patch("llc_pc.training.model_inputs", return_value={}),
+            mock.patch("llc_pc.training.llc_pc_loss", side_effect=losses),
+        ):
+            metrics = evaluate_loss_epoch(
+                DummyModel(), loader, torch.device("cpu")
+            )
+
+        self.assertAlmostEqual(metrics["regression_loss"], 18.0 / 5.0)
+        self.assertAlmostEqual(metrics["classification_loss"], 50.0 / 3.0)
+        self.assertAlmostEqual(
+            metrics["loss"], 18.0 / 5.0 + 50.0 / 3.0
+        )
+
     def test_artifacts_one_step_and_checkpoint(self) -> None:
         rng = np.random.default_rng(11)
         with tempfile.TemporaryDirectory() as directory:
@@ -102,6 +146,14 @@ class TrainingHelpersTest(unittest.TestCase):
                 "evaluation": {"prediction_mode": "top1"},
             }
             retrieved = retrieve_semantic_contexts(batch, config, split="test")
+            validation_retrieved = retrieve_semantic_contexts(
+                batch, config, split="validation"
+            )
+            np.testing.assert_array_equal(
+                validation_retrieved.valid_mask, retrieved.valid_mask
+            )
+            with self.assertRaisesRegex(ValueError, "validation"):
+                retrieve_semantic_contexts(batch, config, split="development")
             dataset = LLCPCArrayDataset(batch, retrieved)
             item = dataset[0]
             torch_batch = {key: value.unsqueeze(0) for key, value in item.items()}
@@ -116,6 +168,26 @@ class TrainingHelpersTest(unittest.TestCase):
             )
             losses["loss"].backward()
             optimizer.step()
+
+            validation_loader = make_loader(
+                LLCPCArrayDataset(batch, validation_retrieved),
+                batch_size=1,
+                shuffle=False,
+                num_workers=0,
+                seed=3,
+            )
+            model.train()
+            parameters_before = {
+                name: value.detach().clone() for name, value in model.named_parameters()
+            }
+            validation_metrics = evaluate_loss_epoch(
+                model, validation_loader, torch.device("cpu")
+            )
+            self.assertTrue(model.training)
+            self.assertTrue(np.isfinite(validation_metrics["loss"]))
+            for name, value in model.named_parameters():
+                torch.testing.assert_close(value, parameters_before[name])
+
             checkpoint = root / "model.pt"
             save_checkpoint(
                 checkpoint,

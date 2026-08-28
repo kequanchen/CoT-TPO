@@ -148,7 +148,7 @@ def load_config(path: Union[str, Path]) -> dict[str, Any]:
     config.setdefault("prompt", {})
     _validate_config(config)
     baseline_root = Path(__file__).resolve().parents[1]
-    for key in ("train_mat", "test_mat"):
+    for key in ("train_mat", "validation_mat", "test_mat"):
         config["data"][key] = _resolve_path(config["data"][key], baseline_root)
     for key, value in list(config["paths"].items()):
         config["paths"][key] = _resolve_path(value, baseline_root)
@@ -216,8 +216,8 @@ def load_configured_split(
     """Load one configured split with explicit control of future-label access."""
 
     normalized = str(split).strip().lower()
-    if normalized not in {"train", "test"}:
-        raise ValueError("split must be 'train' or 'test'")
+    if normalized not in {"train", "validation", "test"}:
+        raise ValueError("split must be 'train', 'validation', or 'test'")
     path = str(config["data"][f"{normalized}_mat"])
     if _is_placeholder(path):
         raise ValueError(
@@ -238,7 +238,14 @@ def load_configured_split(
 
 def _validate_config(config: Mapping[str, Any]) -> None:
     data = config["data"]
-    for key in ("train_mat", "test_mat", "train_key", "test_key"):
+    for key in (
+        "train_mat",
+        "validation_mat",
+        "test_mat",
+        "train_key",
+        "validation_key",
+        "test_key",
+    ):
         if key not in data or not str(data[key]).strip():
             raise ValueError(f"data.{key} must be provided")
     layout = dataset_layout_from_config(config)

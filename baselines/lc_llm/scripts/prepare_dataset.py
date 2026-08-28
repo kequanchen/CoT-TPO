@@ -26,17 +26,19 @@ from lc_llm import (  # noqa: E402
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Build adapted LC-LLM JSONL. Supervised mode is restricted to the "
-            "training split; inference mode never loads y_future."
+            "Build adapted LC-LLM JSONL. Supervised mode is restricted to train "
+            "and validation; inference mode never loads y_future."
         )
     )
     parser.add_argument("--config", required=True, help="Path to a private local JSON config")
-    parser.add_argument("--split", choices=("train", "test"), default="train")
+    parser.add_argument(
+        "--split", choices=("train", "validation", "test"), default="train"
+    )
     parser.add_argument(
         "--mode",
         choices=("supervised", "inference"),
         default=None,
-        help="Default: supervised for train and inference for test",
+        help="Default: supervised for train/validation and inference for test",
     )
     parser.add_argument("--output", default=None, help="Override the configured JSONL path")
     parser.add_argument("--max-samples", type=int, default=None)
@@ -45,10 +47,8 @@ def arguments() -> argparse.Namespace:
 
 
 def prepare(args: argparse.Namespace) -> Path:
-    mode = args.mode or ("supervised" if args.split == "train" else "inference")
+    mode = _resolve_mode(args.split, args.mode)
     supervised = mode == "supervised"
-    if supervised and args.split != "train":
-        raise ValueError("supervised dataset generation is allowed only for --split train")
     if args.max_samples is not None and args.max_samples <= 0:
         raise ValueError("--max-samples must be positive")
     config = load_config(args.config)
@@ -70,12 +70,24 @@ def prepare(args: argparse.Namespace) -> Path:
     if args.output:
         output = Path(args.output).expanduser().resolve()
     else:
-        path_key = "train_jsonl" if supervised else f"{args.split}_jsonl"
+        path_key = f"{args.split}_jsonl"
         configured = config["paths"].get(path_key)
         if configured is None:
             configured = Path(config["paths"]["adapter_dir"]) / f"{args.split}_prompts.jsonl"
         output = Path(configured)
     return write_jsonl(records, output, overwrite=args.overwrite)
+
+
+def _resolve_mode(split: str, mode: str | None) -> str:
+    normalized = str(split).strip().lower()
+    if normalized not in {"train", "validation", "test"}:
+        raise ValueError("split must be 'train', 'validation', or 'test'")
+    resolved = mode or ("inference" if normalized == "test" else "supervised")
+    if resolved == "supervised" and normalized == "test":
+        raise ValueError("supervised dataset generation is forbidden for --split test")
+    if resolved not in {"supervised", "inference"}:
+        raise ValueError("mode must be 'supervised' or 'inference'")
+    return resolved
 
 
 def main() -> None:

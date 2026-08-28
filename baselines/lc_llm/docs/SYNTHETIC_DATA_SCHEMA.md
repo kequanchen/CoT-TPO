@@ -6,17 +6,17 @@ without revealing a real crash, vehicle, prompt, or trajectory.
 
 ## MATLAB Container
 
-The example configuration expects `train_data` and `test_data` struct arrays.
-The keys are configurable. Each element contains:
+The example configuration expects separate `train_data`, `validation_data`,
+and `test_data` struct arrays. The keys are configurable. Each element contains:
 
 | Field | Shape | Use |
 | --- | --- | --- |
-| `scenario_id` | scalar | Event identifier used only for bookkeeping. |
+| `scenario_id` | scalar | Globally stable crash-episode identifier shared by every sliding window from that episode. It is the train/validation leakage boundary and must not be renumbered independently by split. |
 | `traj_id` | scalar | Trajectory identifier within the event. |
 | `lane_status` | scalar | Supervised phase label; never inserted into an inference prompt. |
 | `time_since_crossing` | scalar | Preprocessing metadata; not inserted into the Figure 3 prompt. |
 | `x_hist` | `(T, 6)` | Observed target-vehicle history. |
-| `y_future` | `(H, 2)` | Future labels used only for training answers and post-prediction evaluation. |
+| `y_future` | `(H, 2)` | Future labels used for train/validation supervision and final post-prediction test evaluation. |
 | `ctx` | struct | Observed target and neighboring-vehicle histories. |
 
 The released protocol uses `T = 10` observations at 10 Hz and `H = 50` future
@@ -97,7 +97,7 @@ one valid prediction for every test ID.
 
 ## Generated Training JSONL
 
-One supervised training line contains these top-level fields:
+One supervised training or validation line contains these top-level fields:
 
 ```json
 {

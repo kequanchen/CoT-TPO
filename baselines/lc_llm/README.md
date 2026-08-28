@@ -68,7 +68,7 @@ The directory includes:
 
 - a strict MATLAB adapter and target-centered coordinate transform;
 - the reconstructed and adapted Figure 3 prompt builder;
-- deterministic training-only CoT/intention labels;
+- deterministic train/validation CoT and intention labels;
 - supervised and prompt-only JSONL builders;
 - strict joint-output parsing for exactly 50 coordinate points;
 - LoRA training and restartable batch inference entry points; and
@@ -117,6 +117,7 @@ Edit only the ignored local copy. At minimum, replace:
 {
   "data": {
     "train_mat": "<PATH_TO_TRAIN_MAT>",
+    "validation_mat": "<PATH_TO_VALIDATION_MAT>",
     "test_mat": "<PATH_TO_TEST_MAT>"
   },
   "model": {
@@ -143,7 +144,20 @@ The training JSONL contains the observed prompt and its supervised reasoning,
 intention, and future-coordinate answer. It must be generated locally and must
 not be committed.
 
-### 2. Prepare Prompt-Only Test Records
+### 2. Prepare Supervised Validation Records
+
+```bash
+python scripts/prepare_dataset.py \
+  --config configs/post_crash_lc.local.json \
+  --split validation \
+  --mode supervised
+```
+
+The validation JSONL has the same supervised schema as training but must come
+from disjoint crash episodes. It is evaluated during fine-tuning and is the
+only split used to choose the best LoRA checkpoint.
+
+### 3. Prepare Prompt-Only Test Records
 
 ```bash
 python scripts/prepare_dataset.py \
@@ -157,17 +171,25 @@ no answer, intention, trajectory label, or future coordinates. Inspect a small
 local run first by adding `--max-samples 10` and, when rebuilding an existing
 file, `--overwrite`.
 
-### 3. Fine-Tune the LoRA Adapter
+### 4. Fine-Tune the LoRA Adapter
 
 ```bash
 python scripts/train_lora.py \
   --config configs/post_crash_lc.local.json
 ```
 
-For an installation smoke test, use `--max-samples` and a private configuration
-with reduced logging/checkpoint intervals. A smoke test is not a paper result.
+Training requires both `paths.train_jsonl` and `paths.validation_jsonl`. Every
+validation pass is paired with a saved checkpoint, `eval_loss` is minimized,
+and the LoRA artifacts are copied directly from the winning checkpoint to the
+stable `paths.adapter_dir`. Missing checkpoint weights cause training to fail
+closed. The training manifest records the selected checkpoint and validation
+loss. The training program never opens the test JSONL or test MATLAB file.
 
-### 4. Generate Test Predictions
+For an installation smoke test, use `--max-samples` and a private configuration
+with smaller equal `training.eval_steps` and `training.save_steps`. At least one
+validation/save step must occur. A smoke test is not a paper result.
+
+### 5. Generate Test Predictions
 
 ```bash
 python scripts/predict.py \
@@ -179,7 +201,7 @@ Prediction is restartable by default. Each attempted sample is written once by
 `trajectory` fields; generation and parsing failures remain explicit. To retry
 failed IDs, move or remove the local prediction file and start a fresh run.
 
-### 5. Evaluate Exact Test Coverage
+### 6. Evaluate Exact Test Coverage
 
 ```bash
 python scripts/evaluate.py \
@@ -200,11 +222,15 @@ partial metrics must not be reported as the baseline result.
    answer fields.
 3. `lane_status`, `time_since_crossing`, ground-truth intention, and future CoT
    labels are excluded from the inference prompt.
-4. Training labels and CoT rules are called only by supervised train-record
-   construction.
-5. Evaluation loads the test future only after a prediction JSONL already
+4. Training labels and CoT rules are called only when constructing supervised
+   train or validation records.
+5. Training checks that train and validation have disjoint `sample_id` and
+   `event_id` sets, and selects the adapter only by validation loss.
+6. The training program does not read any test path. Prediction reads only the
+   prompt-only test JSONL after the adapter has been fixed.
+7. Evaluation loads the test future only after a prediction JSONL already
    exists; it never invokes generation.
-6. Predictions are matched by stable IDs, never by file order.
+8. Predictions are matched by stable IDs, never by file order.
 
 ## Reproducibility and Scope
 
@@ -214,7 +240,13 @@ values initialize the example configuration. Details not recoverable from the
 paper, including the authors' complete preprocessing code, exact prompt file,
 random sample list, and adapter weights, cannot be reproduced exactly. The
 included label rules and implementation choices are documented and tested so
-the adaptation itself is auditable.
+the adaptation itself is auditable. The public workflow requires separate
+train, validation, and test inputs. `training.eval_steps` and
+`training.save_steps` must be equal so every measured validation loss belongs
+to a selectable checkpoint. `scenario_id` must be a globally stable crash
+episode identifier shared by all sliding windows from that episode; do not
+renumber it independently inside each split. Form the 35/5/10 crash-episode
+partition before constructing sliding windows.
 
 ## Tests
 

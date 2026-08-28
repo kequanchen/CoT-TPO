@@ -1,8 +1,8 @@
-"""Deterministic training-only labels for the adapted LC-LLM response.
+"""Deterministic supervision-only labels for the adapted LC-LLM response.
 
 The original LC-LLM paper programmatically labels CoT supervision using
 driving rules.  These domain-adapted rules use the observed kinematics for
-notable features and use the labelled training sample to choose the supervised
+notable features and use a labelled train or validation sample to choose the supervised
 intention and trajectory.  Nothing in this module is called by inference
 prompt construction.
 """

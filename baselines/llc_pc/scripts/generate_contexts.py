@@ -33,7 +33,9 @@ def _arguments() -> argparse.Namespace:
         description="Render observation-only TC-maps and optionally query an OpenAI-compatible VLM."
     )
     parser.add_argument("--config", required=True, help="Path to a local LLC-PC JSON config")
-    parser.add_argument("--split", choices=("train", "test"), default="train")
+    parser.add_argument(
+        "--split", choices=("train", "validation", "test"), default="train"
+    )
     parser.add_argument(
         "--skip-llm",
         action="store_true",

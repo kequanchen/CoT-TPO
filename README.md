@@ -62,15 +62,36 @@ pip install -r requirements.txt
 
 ## CoT-TP Pipeline
 
+### Data Partition and Model Selection
+
+Partition the crash episodes before constructing any sliding windows. For the
+paper split, the 50 crash episodes are assigned to 35 training, 5 validation,
+and 10 test episodes, corresponding to 70%, 10%, and 20%. Generate sliding
+windows separately within each partition so that all windows from one crash
+episode remain in the same partition.
+
+The raw crash trajectories and private preprocessing are not distributed, so
+these training programs consume the three already partitioned MATLAB files;
+they do not split overlapping windows internally. The three MAT paths and the
+three strategy-vector directories must be distinct.
+
+Prepare three MATLAB files with the keys `train_data`, `validation_data`, and
+`test_data`, together with matching strategy-vector directories for the three
+partitions. Both training scripts evaluate the validation set during training
+and use it for checkpoint selection. The test set is loaded only after the best
+validation checkpoint has been fixed and is evaluated once for the final
+reported metrics. The scripts do not create a validation set by randomly
+splitting already generated windows.
+
 ### 1. Generate LLM Teacher Responses
 
 Generate prompts only:
 
 ```bash
 python scripts/generate_llm_teacher.py \
-  --data-path data/test_dataset.mat \
-  --data-key test_data \
-  --sample-idx 10 \
+  --data-path data/train_dataset.mat \
+  --data-key train_data \
+  --all-samples \
   --vehicle-length VEHICLE_LENGTH_METERS \
   --vehicle-width VEHICLE_WIDTH_METERS \
   --ego-x-col EGO_X_COL \
@@ -83,7 +104,7 @@ python scripts/generate_llm_teacher.py \
   --neighbor-lon-v-col NEIGHBOR_LON_V_COL \
   --neighbor-lat-v-col NEIGHBOR_LAT_V_COL \
   --neighbor-acc-col NEIGHBOR_ACC_COL \
-  --output-dir outputs/llm_cot \
+  --output-dir outputs/llm_cot_prompt_check/train \
   --skip-llm
 ```
 
@@ -94,9 +115,9 @@ export LLM_API_KEY="YOUR_API_KEY"
 export LLM_BASE_URL="YOUR_OPENAI_COMPATIBLE_BASE_URL"
 
 python scripts/generate_llm_teacher.py \
-  --data-path data/test_dataset.mat \
-  --data-key test_data \
-  --sample-idx 10 \
+  --data-path data/train_dataset.mat \
+  --data-key train_data \
+  --all-samples \
   --vehicle-length VEHICLE_LENGTH_METERS \
   --vehicle-width VEHICLE_WIDTH_METERS \
   --ego-x-col EGO_X_COL \
@@ -109,7 +130,7 @@ python scripts/generate_llm_teacher.py \
   --neighbor-lon-v-col NEIGHBOR_LON_V_COL \
   --neighbor-lat-v-col NEIGHBOR_LAT_V_COL \
   --neighbor-acc-col NEIGHBOR_ACC_COL \
-  --output-dir outputs/llm_cot
+  --output-dir outputs/llm_cot/train
 ```
 
 On PowerShell, set the variables with
@@ -120,21 +141,34 @@ On PowerShell, set the variables with
 
 ```bash
 python scripts/parse_strategy_vectors.py \
-  --responses-dir outputs/llm_cot \
-  --prompts-dir outputs/llm_cot \
-  --out-dir doc/traininput
+  --responses-dir outputs/llm_cot/train \
+  --prompts-dir outputs/llm_cot/train \
+  --out-dir doc/traininput \
+  --strict
 ```
 
 The parser writes `ids.npy`, `c.npy`, `vocab.json`, `meta.csv`,
 `records.jsonl`, `summary.json`, and optionally `errors.log`.
+Repeat teacher generation and parsing for the validation and test partitions,
+using their matching MATLAB keys and writing the parsed vectors to
+`doc/validationinput` and `doc/testinput`, respectively.
+Vector IDs are the zero-based row indices of the corresponding MATLAB split.
+The training scripts require exact coverage and reject duplicate or missing
+IDs rather than substituting a neighboring or zero vector. For a one-sample
+prompt sanity check, replace `--all-samples` with `--sample-idx 10`.
+Each `--all-samples` run requires a new or clean output directory so responses
+from an earlier split cannot be reused accidentally. The parser clears its own
+previously derived files before rebuilding them.
 
 ### 3. Distill the MLP Strategy Student
 
 ```bash
 python scripts/train_strategy_student_mlp.py \
   --train-mat data/train_dataset.mat \
+  --val-mat data/validation_dataset.mat \
   --test-mat data/test_dataset.mat \
   --train-vector-dir doc/traininput \
+  --val-vector-dir doc/validationinput \
   --test-vector-dir doc/testinput \
   --out-dir outputs/student_mlp \
   --ego-x-col EGO_X_COL \
@@ -152,8 +186,10 @@ python scripts/train_strategy_student_mlp.py \
 ```bash
 python scripts/train_cot_tp_film.py \
   --train-mat data/train_dataset.mat \
+  --val-mat data/validation_dataset.mat \
   --test-mat data/test_dataset.mat \
   --train-vector-dir doc/traininput \
+  --val-vector-dir doc/validationinput \
   --test-vector-dir doc/testinput \
   --student-ckpt outputs/student_mlp/strategy_student_distill.pth \
   --out-dir outputs/cot_tp_film \
@@ -165,6 +201,10 @@ The internal `--num-samples` setting controls the number of stochastic CVAE
 candidate trajectories averaged to form the baseline trajectory in Eq. (9).
 For paper-aligned evaluation, the complete stochastic prediction is repeated
 20 times and ADE/FDE are averaged across these repeats (`--eval-repeats 20`).
+These repeats are part of one final evaluation of the fixed checkpoint and are
+not used for model selection. Per-epoch histories contain validation metrics
+only. Final test metrics are written separately to `test_metrics.json` for the
+student and `final_test_metrics.json` for the trajectory predictor.
 
 Run any script with `--help` to inspect all options.
 

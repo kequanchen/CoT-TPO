@@ -25,6 +25,7 @@ from llc_pc import (  # noqa: E402
 from llc_pc.training import (  # noqa: E402
     LLCPCArrayDataset,
     build_model,
+    evaluate_loss_epoch,
     make_loader,
     model_inputs,
     move_batch,
@@ -39,11 +40,56 @@ from llc_pc.training import (  # noqa: E402
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
-    parser.add_argument("--limit", type=int, default=None, help="Optional debug-only sample limit")
+    parser.add_argument(
+        "--limit", type=int, default=None, help="Optional debug-only training sample limit"
+    )
+    parser.add_argument(
+        "--validation-limit",
+        type=int,
+        default=None,
+        help="Optional debug-only validation sample limit",
+    )
     parser.add_argument("--epochs", type=int, default=None, help="Override train.epochs")
     parser.add_argument("--max-batches", type=int, default=None, help="Debug-only batches per epoch")
     parser.add_argument("--device", default=None, help="Override train.device")
     return parser.parse_args()
+
+
+def _load_supervised_dataset(
+    config: dict,
+    split: str,
+    limit: int | None,
+) -> LLCPCArrayDataset:
+    samples = load_configured_split(config, split, include_future=True)
+    if limit is not None:
+        if limit <= 0:
+            raise ValueError(f"{split} sample limit must be positive")
+        samples = samples[:limit]
+    tensors = tensorize_samples(samples, TensorizerConfig.from_config(config))
+    retrieved = retrieve_semantic_contexts(tensors, config, split=split)
+    if not retrieved.valid_mask.any(axis=1).all():
+        missing = int((~retrieved.valid_mask.any(axis=1)).sum())
+        raise RuntimeError(
+            f"{missing} {split} samples have no eligible training semantic context; "
+            "expand the training context database or relax event exclusion"
+        )
+    return LLCPCArrayDataset(tensors, retrieved, require_future=True)
+
+
+def _require_disjoint_event_ids(
+    train_dataset: LLCPCArrayDataset,
+    validation_dataset: LLCPCArrayDataset,
+) -> None:
+    """Fail if any crash episode contributes windows to both splits."""
+
+    train_events = {str(value) for value in train_dataset.batch.event_ids}
+    validation_events = {str(value) for value in validation_dataset.batch.event_ids}
+    overlap = sorted(train_events & validation_events)
+    if overlap:
+        raise ValueError(
+            "training and validation splits overlap in crash episode IDs: "
+            + ", ".join(overlap[:5])
+        )
 
 
 def train(args: argparse.Namespace) -> Path:
@@ -53,24 +99,22 @@ def train(args: argparse.Namespace) -> Path:
     set_reproducible_seed(seed)
     device = resolve_device(args.device or settings.get("device", "auto"))
 
-    samples = load_configured_split(config, "train", include_future=True)
-    if args.limit is not None:
-        if args.limit <= 0:
-            raise ValueError("--limit must be positive")
-        samples = samples[: args.limit]
-    tensors = tensorize_samples(samples, TensorizerConfig.from_config(config))
-    retrieved = retrieve_semantic_contexts(tensors, config, split="train")
-    if not retrieved.valid_mask.any(axis=1).all():
-        missing = int((~retrieved.valid_mask.any(axis=1)).sum())
-        raise RuntimeError(
-            f"{missing} training samples have no eligible semantic context; "
-            "expand the training context database or relax event exclusion"
-        )
-    dataset = LLCPCArrayDataset(tensors, retrieved, require_future=True)
-    loader = make_loader(
-        dataset,
+    train_dataset = _load_supervised_dataset(config, "train", args.limit)
+    validation_dataset = _load_supervised_dataset(
+        config, "validation", getattr(args, "validation_limit", None)
+    )
+    _require_disjoint_event_ids(train_dataset, validation_dataset)
+    train_loader = make_loader(
+        train_dataset,
         batch_size=int(settings["batch_size"]),
         shuffle=True,
+        num_workers=int(settings.get("num_workers", 0)),
+        seed=seed,
+    )
+    validation_loader = make_loader(
+        validation_dataset,
+        batch_size=int(settings["batch_size"]),
+        shuffle=False,
         num_workers=int(settings.get("num_workers", 0)),
         seed=seed,
     )
@@ -86,14 +130,15 @@ def train(args: argparse.Namespace) -> Path:
         raise ValueError("number of epochs must be positive")
 
     checkpoint_dir = Path(config["paths"]["checkpoint_dir"])
-    history: list[dict[str, float]] = []
-    best_loss = math.inf
+    history: list[dict[str, float | bool | str]] = []
+    best_validation_loss = math.inf
+    best_epoch: int | None = None
     best_path = checkpoint_dir / "best.pt"
     for epoch in range(1, epochs + 1):
         model.train()
         totals = {"loss": 0.0, "regression_loss": 0.0, "classification_loss": 0.0}
         examples = 0
-        for batch_index, batch in enumerate(loader):
+        for batch_index, batch in enumerate(train_loader):
             if args.max_batches is not None and batch_index >= args.max_batches:
                 break
             batch = move_batch(batch, device)
@@ -114,13 +159,41 @@ def train(args: argparse.Namespace) -> Path:
                 totals[key] += float(losses[key].detach().cpu()) * count
         if examples == 0:
             raise RuntimeError("no training batches were processed")
-        metrics = {key: value / examples for key, value in totals.items()}
-        metrics["epoch"] = float(epoch)
+        train_metrics = {key: value / examples for key, value in totals.items()}
+        validation_metrics = evaluate_loss_epoch(model, validation_loader, device)
+        if not math.isfinite(validation_metrics["loss"]):
+            raise RuntimeError("validation loss is not finite")
+        is_best = validation_metrics["loss"] < best_validation_loss
+        if is_best:
+            best_validation_loss = validation_metrics["loss"]
+            best_epoch = epoch
+        metrics: dict[str, float | bool | str] = {
+            "epoch": float(epoch),
+            # Preserve the original metric keys for consumers of format-v1
+            # checkpoints; selection is explicitly based on validation_loss.
+            "loss": train_metrics["loss"],
+            "regression_loss": train_metrics["regression_loss"],
+            "classification_loss": train_metrics["classification_loss"],
+            "train_loss": train_metrics["loss"],
+            "train_regression_loss": train_metrics["regression_loss"],
+            "train_classification_loss": train_metrics["classification_loss"],
+            "validation_loss": validation_metrics["loss"],
+            "validation_regression_loss": validation_metrics["regression_loss"],
+            "validation_classification_loss": validation_metrics["classification_loss"],
+            "best_validation_loss": best_validation_loss,
+            "is_best": is_best,
+            "selection_split": "validation",
+            "selection_metric": "validation_loss",
+        }
         history.append(metrics)
         print(
-            f"epoch={epoch:03d} loss={metrics['loss']:.6f} "
-            f"reg={metrics['regression_loss']:.6f} "
-            f"cls={metrics['classification_loss']:.6f}"
+            f"epoch={epoch:03d} "
+            f"train_loss={metrics['train_loss']:.6f} "
+            f"train_reg={metrics['train_regression_loss']:.6f} "
+            f"train_cls={metrics['train_classification_loss']:.6f} "
+            f"validation_loss={metrics['validation_loss']:.6f} "
+            f"validation_reg={metrics['validation_regression_loss']:.6f} "
+            f"validation_cls={metrics['validation_classification_loss']:.6f}"
         )
         save_checkpoint(
             checkpoint_dir / "last.pt",
@@ -130,8 +203,7 @@ def train(args: argparse.Namespace) -> Path:
             config=config,
             metrics=metrics,
         )
-        if metrics["loss"] < best_loss:
-            best_loss = metrics["loss"]
+        if is_best:
             save_checkpoint(
                 best_path,
                 model,
@@ -140,7 +212,16 @@ def train(args: argparse.Namespace) -> Path:
                 config=config,
                 metrics=metrics,
             )
-    write_json(checkpoint_dir / "training_history.json", {"epochs": history})
+    write_json(
+        checkpoint_dir / "training_history.json",
+        {
+            "selection_split": "validation",
+            "selection_metric": "validation_loss",
+            "best_epoch": best_epoch,
+            "best_validation_loss": best_validation_loss,
+            "epochs": history,
+        },
+    )
     return best_path
 
 

@@ -297,6 +297,20 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    # Remove only files derived by this parser. This prevents a failed or empty
+    # parse from leaving apparently valid vectors from an earlier dataset run.
+    for name in (
+        "ids.npy",
+        "c.npy",
+        "vocab.json",
+        "meta.csv",
+        "records.jsonl",
+        "summary.json",
+        "errors.log",
+    ):
+        path = args.out_dir / name
+        if path.exists():
+            path.unlink()
 
     response_paths = iter_response_paths(args.responses_dir, args.recursive)
     errors = []

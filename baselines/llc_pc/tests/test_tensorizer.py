@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import copy
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
+import scipy.io
 
 
 BASELINE_ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +21,7 @@ from llc_pc import (  # noqa: E402
     adapt_sample,
     dataset_layout_from_config,
     load_config,
+    load_configured_split,
     standardizer_path_for_index,
     tensorize_sample,
     tensorize_samples,
@@ -119,11 +122,49 @@ class TensorizerTests(unittest.TestCase):
         path = BASELINE_ROOT / "configs" / "post_crash_lc.example.json"
         config = load_config(path)
         self.assertEqual(config["data"]["train_mat"], "<PATH_TO_TRAIN_MAT>")
+        self.assertEqual(
+            config["data"]["validation_mat"], "<PATH_TO_VALIDATION_MAT>"
+        )
+        self.assertEqual(config["data"]["validation_key"], "validation_data")
         self.assertTrue(Path(config["paths"]["context_index"]).is_absolute())
         layout = dataset_layout_from_config(config)
         self.assertEqual(layout.history_steps, 10)
         self.assertEqual(layout.prediction_seconds, 5.0)
         self.assertEqual(TensorizerConfig.from_config(config).future_steps, 50)
+
+    def test_config_requires_an_explicit_validation_split(self) -> None:
+        example = BASELINE_ROOT / "configs" / "post_crash_lc.example.json"
+        payload = json.loads(example.read_text(encoding="utf-8"))
+        del payload["data"]["validation_mat"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing_validation.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "data.validation_mat"):
+                load_config(path)
+
+    def test_validation_split_uses_its_own_mat_and_key(self) -> None:
+        example = BASELINE_ROOT / "configs" / "post_crash_lc.example.json"
+        payload = json.loads(example.read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            validation_mat = root / "validation.mat"
+            scipy.io.savemat(validation_mat, {"validation_data": _raw_sample()})
+            payload["data"]["validation_mat"] = str(validation_mat)
+            config_path = root / "validation_config.json"
+            config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            config = load_config(config_path)
+            samples = load_configured_split(
+                config, "validation", include_future=True
+            )
+            self.assertEqual(len(samples), 1)
+            self.assertIsNotNone(samples[0].future)
+
+            payload["data"]["validation_key"] = "test_data"
+            config_path.write_text(json.dumps(payload), encoding="utf-8")
+            config = load_config(config_path)
+            with self.assertRaisesRegex(KeyError, "test_data"):
+                load_configured_split(config, "validation", include_future=True)
 
 
 if __name__ == "__main__":

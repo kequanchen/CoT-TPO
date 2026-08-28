@@ -1108,9 +1108,14 @@ def build_column_schemas(args: argparse.Namespace) -> tuple[Optional[MatrixCols]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate LLM CoT strategy labels from trajectory samples.")
-    parser.add_argument("--data-path", type=Path, default=Path("data/test_dataset.mat"))
-    parser.add_argument("--data-key", type=str, default="test_data")
+    parser.add_argument("--data-path", type=Path, default=Path("data/train_dataset.mat"))
+    parser.add_argument("--data-key", type=str, default="train_data")
     parser.add_argument("--sample-idx", type=int, default=10)
+    parser.add_argument(
+        "--all-samples",
+        action="store_true",
+        help="Process every sample in the selected MAT split in zero-based row order.",
+    )
     parser.add_argument("--random-sample", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/llm_cot"))
     parser.add_argument("--model", type=str, default="qwen-plus")
@@ -1140,6 +1145,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def require_clean_batch_output(output_dir: Path) -> None:
+    """Prevent responses from an earlier dataset run entering a new batch."""
+
+    if not output_dir.exists():
+        return
+    stale = []
+    for pattern in ("prompt_sample_*.txt", "response_sample_*.txt", "batch_summary.json"):
+        stale.extend(output_dir.glob(pattern))
+    if stale:
+        raise FileExistsError(
+            f"Batch output directory contains prior sample artifacts: {output_dir}. "
+            "Choose a new or clean directory for this split."
+        )
+
+
 def main(args: Optional[argparse.Namespace] = None) -> None:
     args = args or parse_args()
 
@@ -1158,13 +1178,20 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     except Exception as exc:
         print(f"Failed to load data: {exc}")
         return
+    if len(samples) == 0:
+        raise ValueError(f"No samples found in {args.data_path} [{args.data_key}]")
+
+    if args.all_samples and args.random_sample:
+        raise ValueError("--all-samples and --random-sample cannot be used together")
+    if args.all_samples:
+        require_clean_batch_output(args.output_dir)
 
     if args.random_sample:
         sample_idx = random.randint(0, len(samples) - 1)
     else:
         sample_idx = args.sample_idx
 
-    if sample_idx < 0 or sample_idx >= len(samples):
+    if not args.all_samples and (sample_idx < 0 or sample_idx >= len(samples)):
         print(f"Sample index out of range. Valid range: 0 to {len(samples) - 1}")
         return
 
@@ -1179,10 +1206,6 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         print("Use --ego-*-col and --neighbor-*-col arguments, or the matching COTTP_* environment variables.")
         return
 
-    parsed = parse_sample(samples[sample_idx])
-    status_names = {0: "ANTICIPATION", 1: "CROSSING", 2: "RELAXATION"}
-    print(f"Selected sample #{sample_idx}; lane_status={parsed.get('status', 0)} ({status_names.get(parsed.get('status', 0), 'UNKNOWN')})")
-
     client = None
     if not args.skip_llm:
         try:
@@ -1192,28 +1215,56 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             print("Use --skip-llm to generate prompts without making API calls.")
             return
 
-    result = process_sample(
-        samples[sample_idx],
-        sample_idx,
-        client=client,
-        model=args.model,
-        temperature=args.temperature,
-        max_tokens=args.max_tokens,
-        vehicle_length=args.vehicle_length,
-        vehicle_width=args.vehicle_width,
-        ego_cols=ego_cols,
-        neighbor_cols=neighbor_cols,
-        output_dir=args.output_dir,
-        verbose=True,
-        save_prompt=args.save_prompt,
-        skip_llm=args.skip_llm,
-        enable_thinking=args.enable_thinking,
-    )
+    indices = range(len(samples)) if args.all_samples else [sample_idx]
+    batch_records = []
+    status_names = {0: "ANTICIPATION", 1: "CROSSING", 2: "RELAXATION"}
+    for position, index in enumerate(indices, start=1):
+        parsed = parse_sample(samples[index])
+        print(
+            f"Selected sample #{index}; lane_status={parsed.get('status', 0)} "
+            f"({status_names.get(parsed.get('status', 0), 'UNKNOWN')})"
+        )
+        if args.all_samples:
+            print(f"Batch progress: {position}/{len(samples)}")
+        result = process_sample(
+            samples[index],
+            index,
+            client=client,
+            model=args.model,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+            vehicle_length=args.vehicle_length,
+            vehicle_width=args.vehicle_width,
+            ego_cols=ego_cols,
+            neighbor_cols=neighbor_cols,
+            output_dir=args.output_dir,
+            verbose=not args.all_samples,
+            save_prompt=args.save_prompt,
+            skip_llm=args.skip_llm,
+            enable_thinking=args.enable_thinking,
+        )
+        batch_records.append(
+            {
+                "sample_idx": index,
+                "success": bool(result.get("success", False)),
+                "skipped_llm": bool(result.get("skipped_llm", False)),
+            }
+        )
 
-    labels = extract_cvae_labels(result)
-    if labels is not None:
-        print("\nDownstream labels:")
-        print(json.dumps(labels, indent=2, ensure_ascii=False))
+        if not args.all_samples:
+            labels = extract_cvae_labels(result)
+            if labels is not None:
+                print("\nDownstream labels:")
+                print(json.dumps(labels, indent=2, ensure_ascii=False))
+
+    if args.all_samples:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = args.output_dir / "batch_summary.json"
+        summary_path.write_text(
+            json.dumps(batch_records, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print(f"Saved batch summary to: {summary_path}")
 
     print("\nDone.")
 
@@ -1233,7 +1284,7 @@ def batch_process(
     vehicle_width: float,
     ego_cols: MatrixCols,
     neighbor_cols: MatrixCols,
-    data_key: str = "test_data",
+    data_key: str = "train_data",
     num_samples: Optional[int] = None,
     skip_llm: bool = True,
 ) -> None:

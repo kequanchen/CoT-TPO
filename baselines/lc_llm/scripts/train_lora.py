@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import math
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, Mapping
@@ -65,7 +67,11 @@ def train(args: argparse.Namespace) -> Path:
     seed = int(args.seed if args.seed is not None else training_cfg.get("seed", 42))
     set_global_seed(seed, deterministic=bool(training_cfg.get("deterministic", False)))
     train_path = _configured_path(paths.get("train_jsonl"), "paths.train_jsonl")
-    validation_path = _optional_configured_path(paths.get("validation_jsonl"))
+    validation_path = _configured_path(
+        paths.get("validation_jsonl"), "paths.validation_jsonl"
+    )
+    if validation_path == train_path:
+        raise ValueError("paths.train_jsonl and paths.validation_jsonl must be different files")
     output_dir = _configured_path(paths.get("adapter_dir"), "paths.adapter_dir", create_parent=True)
     if output_dir.exists() and any(output_dir.iterdir()) and args.resume_from_checkpoint is None:
         raise FileExistsError(
@@ -80,19 +86,19 @@ def train(args: argparse.Namespace) -> Path:
         train_path,
         require_answer=True,
         max_records=args.max_samples,
+        expected_source_split="train",
+        require_event_id=True,
     )
-    validation_records = (
-        load_jsonl_records(validation_path, require_answer=True)
-        if validation_path is not None
-        else None
+    validation_records = load_jsonl_records(
+        validation_path,
+        require_answer=True,
+        expected_source_split="validation",
+        require_event_id=True,
     )
+    _validate_training_split_isolation(train_records, validation_records)
     tokenizer = load_tokenizer(base_model, local_files_only=local_only)
     train_dataset = TokenizedSFTDataset(train_records, tokenizer, max_length=max_length)
-    eval_dataset = (
-        TokenizedSFTDataset(validation_records, tokenizer, max_length=max_length)
-        if validation_records
-        else None
-    )
+    eval_dataset = TokenizedSFTDataset(validation_records, tokenizer, max_length=max_length)
 
     quantized_4bit = bool(model_cfg.get("load_in_4bit", False))
     quantized_8bit = bool(model_cfg.get("load_in_8bit", False))
@@ -127,43 +133,13 @@ def train(args: argparse.Namespace) -> Path:
     if hasattr(model, "print_trainable_parameters"):
         model.print_trainable_parameters()
 
-    has_eval = eval_dataset is not None
-    training_kwargs: dict[str, Any] = {
-        "output_dir": str(output_dir),
-        "num_train_epochs": float(training_cfg.get("epochs", 2)),
-        "per_device_train_batch_size": int(training_cfg.get("batch_size", 1)),
-        "per_device_eval_batch_size": int(training_cfg.get("eval_batch_size", 1)),
-        "gradient_accumulation_steps": int(
-            training_cfg.get("gradient_accumulation_steps", 8)
-        ),
-        "learning_rate": float(training_cfg.get("learning_rate", 5e-4)),
-        "weight_decay": float(training_cfg.get("weight_decay", 0.0)),
-        "warmup_steps": int(training_cfg.get("warmup_steps", 600)),
-        "logging_steps": int(training_cfg.get("logging_steps", 10)),
-        "save_steps": int(training_cfg.get("save_steps", 200)),
-        "eval_steps": int(training_cfg.get("eval_steps", 200)),
-        "save_strategy": "steps",
-        "save_safetensors": True,
-        "logging_strategy": "steps",
-        "save_total_limit": int(training_cfg.get("save_total_limit", 2)),
-        "seed": seed,
-        "data_seed": seed,
-        "fp16": bool(training_cfg.get("fp16", False)),
-        "bf16": bool(training_cfg.get("bf16", False)),
-        "gradient_checkpointing": gradient_checkpointing,
-        "remove_unused_columns": True,
-        "report_to": [],
-        "optim": str(training_cfg.get("optim", "adamw_torch")),
-        "dataloader_num_workers": int(training_cfg.get("num_workers", 0)),
-        "ddp_find_unused_parameters": False,
-    }
-    if has_eval:
-        strategy_key = (
-            "eval_strategy"
-            if "eval_strategy" in inspect.signature(TrainingArguments.__init__).parameters
-            else "evaluation_strategy"
-        )
-        training_kwargs[strategy_key] = "steps"
+    training_kwargs = _training_argument_kwargs(
+        training_cfg,
+        output_dir=output_dir,
+        seed=seed,
+        gradient_checkpointing=gradient_checkpointing,
+        training_arguments_class=TrainingArguments,
+    )
     training_args = TrainingArguments(**training_kwargs)
     trainer_kwargs: dict[str, Any] = {
         "model": model,
@@ -188,18 +164,27 @@ def train(args: argparse.Namespace) -> Path:
     elif resume is not None:
         resume = str(_safe_trainer_checkpoint(output_dir, resume))
     trainer.train(resume_from_checkpoint=resume)
-    trainer.save_model(str(output_dir))
-    tokenizer.save_pretrained(str(output_dir), safe_serialization=True)
-    _write_training_manifest(
-        output_dir,
-        base_model=base_model,
-        train_count=len(train_dataset),
-        validation_count=0 if eval_dataset is None else len(eval_dataset),
-        seed=seed,
-        max_length=max_length,
-        lora=lora_settings,
-        quantization="4bit" if quantized_4bit else "8bit" if quantized_8bit else "none",
-    )
+    best_checkpoint, best_validation_loss = _validated_best_selection(trainer, output_dir)
+    _wait_for_everyone(trainer)
+    if trainer.is_world_process_zero():
+        # Export the selected checkpoint files themselves. This is fail-closed
+        # even if a particular Trainer/PEFT version fails to restore the best
+        # adapter into the in-memory model at the end of training.
+        _export_best_adapter(best_checkpoint, output_dir)
+        tokenizer.save_pretrained(str(output_dir), safe_serialization=True)
+        _write_training_manifest(
+            output_dir,
+            base_model=base_model,
+            train_count=len(train_dataset),
+            validation_count=len(eval_dataset),
+            best_checkpoint=best_checkpoint.name,
+            best_validation_loss=best_validation_loss,
+            seed=seed,
+            max_length=max_length,
+            lora=lora_settings,
+            quantization="4bit" if quantized_4bit else "8bit" if quantized_8bit else "none",
+        )
+    _wait_for_everyone(trainer)
     return output_dir
 
 
@@ -237,12 +222,6 @@ def _configured_path(value: Any, field: str, *, create_parent: bool = False) -> 
     return path
 
 
-def _optional_configured_path(value: Any) -> Path | None:
-    if value is None or (isinstance(value, str) and (not value.strip() or _placeholder(value))):
-        return None
-    return _configured_path(value, "paths.validation_jsonl")
-
-
 def _placeholder(value: str) -> bool:
     stripped = value.strip()
     return stripped.startswith("<") and stripped.endswith(">")
@@ -260,12 +239,144 @@ def _safe_trainer_checkpoint(output_dir: Path, value: str | Path) -> Path:
     return checkpoint
 
 
+def _training_argument_kwargs(
+    training_cfg: Mapping[str, Any],
+    *,
+    output_dir: Path,
+    seed: int,
+    gradient_checkpointing: bool,
+    training_arguments_class: Any,
+) -> dict[str, Any]:
+    """Build an auditable validation-selection schedule across HF versions."""
+
+    save_steps = int(training_cfg.get("save_steps", 200))
+    eval_steps = int(training_cfg.get("eval_steps", 200))
+    if save_steps <= 0 or eval_steps <= 0:
+        raise ValueError("training.save_steps and training.eval_steps must be positive")
+    if save_steps != eval_steps:
+        raise ValueError(
+            "training.save_steps must equal training.eval_steps so every validation "
+            "measurement corresponds to a selectable checkpoint"
+        )
+    save_total_limit = int(training_cfg.get("save_total_limit", 2))
+    if save_total_limit <= 0:
+        raise ValueError("training.save_total_limit must be positive")
+    parameters = inspect.signature(training_arguments_class.__init__).parameters
+    strategy_key = "eval_strategy" if "eval_strategy" in parameters else "evaluation_strategy"
+    return {
+        "output_dir": str(output_dir),
+        "num_train_epochs": float(training_cfg.get("epochs", 2)),
+        "per_device_train_batch_size": int(training_cfg.get("batch_size", 1)),
+        "per_device_eval_batch_size": int(training_cfg.get("eval_batch_size", 1)),
+        "gradient_accumulation_steps": int(
+            training_cfg.get("gradient_accumulation_steps", 8)
+        ),
+        "learning_rate": float(training_cfg.get("learning_rate", 5e-4)),
+        "weight_decay": float(training_cfg.get("weight_decay", 0.0)),
+        "warmup_steps": int(training_cfg.get("warmup_steps", 600)),
+        "logging_steps": int(training_cfg.get("logging_steps", 10)),
+        "save_steps": save_steps,
+        "eval_steps": eval_steps,
+        "save_strategy": "steps",
+        strategy_key: "steps",
+        "load_best_model_at_end": True,
+        "metric_for_best_model": "eval_loss",
+        "greater_is_better": False,
+        "save_safetensors": True,
+        "logging_strategy": "steps",
+        "save_total_limit": save_total_limit,
+        "seed": seed,
+        "data_seed": seed,
+        "fp16": bool(training_cfg.get("fp16", False)),
+        "bf16": bool(training_cfg.get("bf16", False)),
+        "gradient_checkpointing": gradient_checkpointing,
+        "remove_unused_columns": True,
+        "report_to": [],
+        "optim": str(training_cfg.get("optim", "adamw_torch")),
+        "dataloader_num_workers": int(training_cfg.get("num_workers", 0)),
+        "ddp_find_unused_parameters": False,
+    }
+
+
+def _validate_training_split_isolation(
+    train_records: list[Any], validation_records: list[Any]
+) -> None:
+    train_ids = {record.sample_id for record in train_records}
+    validation_ids = {record.sample_id for record in validation_records}
+    duplicate_ids = sorted(train_ids & validation_ids)
+    if duplicate_ids:
+        raise ValueError(
+            "train and validation JSONL overlap in sample_id: "
+            + ", ".join(duplicate_ids[:5])
+        )
+    train_events = {record.event_id for record in train_records}
+    validation_events = {record.event_id for record in validation_records}
+    duplicate_events = sorted(train_events & validation_events)
+    if duplicate_events:
+        raise ValueError(
+            "train and validation JSONL overlap in event_id: "
+            + ", ".join(str(item) for item in duplicate_events[:5])
+        )
+
+
+def _validated_best_selection(trainer: Any, output_dir: Path) -> tuple[Path, float]:
+    """Require evidence that Trainer selected a materialized validation winner."""
+
+    state = getattr(trainer, "state", None)
+    raw_checkpoint = getattr(state, "best_model_checkpoint", None)
+    raw_metric = getattr(state, "best_metric", None)
+    if not raw_checkpoint or raw_metric is None:
+        raise RuntimeError(
+            "training completed without a selectable validation checkpoint; reduce "
+            "training.eval_steps and training.save_steps so validation runs at least once"
+        )
+    metric = float(raw_metric)
+    if not math.isfinite(metric):
+        raise RuntimeError(f"best validation loss is not finite: {metric}")
+    candidate = Path(raw_checkpoint).expanduser()
+    if not candidate.is_absolute():
+        candidate = output_dir / candidate
+    checkpoint = _safe_trainer_checkpoint(output_dir, candidate)
+    _required_adapter_artifacts(checkpoint)
+    return checkpoint, metric
+
+
+def _required_adapter_artifacts(checkpoint: Path) -> tuple[Path, Path]:
+    weights = checkpoint / "adapter_model.safetensors"
+    config = checkpoint / "adapter_config.json"
+    missing = [path.name for path in (weights, config) if not path.is_file()]
+    if missing:
+        raise RuntimeError(
+            f"selected validation checkpoint {checkpoint.name} is missing LoRA artifacts: "
+            + ", ".join(missing)
+        )
+    return weights, config
+
+
+def _export_best_adapter(checkpoint: Path, output_dir: Path) -> None:
+    """Copy the validation-selected LoRA adapter to the stable inference path."""
+
+    weights, config = _required_adapter_artifacts(checkpoint)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(weights, output_dir / weights.name)
+    shutil.copy2(config, output_dir / config.name)
+
+
+def _wait_for_everyone(trainer: Any) -> None:
+    accelerator = getattr(trainer, "accelerator", None)
+    wait = getattr(accelerator, "wait_for_everyone", None)
+    if callable(wait):
+        wait()
+
+
 def _write_training_manifest(
     output_dir: Path,
     *,
     base_model: str,
     train_count: int,
     validation_count: int,
+    best_checkpoint: str,
+    best_validation_loss: float,
     seed: int,
     max_length: int,
     lora: Any,
@@ -277,6 +388,14 @@ def _write_training_manifest(
         "base_model": base_model,
         "train_records": train_count,
         "validation_records": validation_count,
+        "model_selection": {
+            "split": "validation",
+            "metric": "eval_loss",
+            "greater_is_better": False,
+            "best_checkpoint": best_checkpoint,
+            "best_validation_loss": best_validation_loss,
+            "test_records_used": 0,
+        },
         "seed": seed,
         "max_seq_length": max_length,
         "quantization": quantization,

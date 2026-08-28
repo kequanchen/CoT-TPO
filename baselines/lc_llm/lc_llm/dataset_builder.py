@@ -22,8 +22,8 @@ from .schema import format_lc_llm_output
 
 def _split_name(source_split: str) -> str:
     normalized = str(source_split).strip().lower()
-    if normalized not in {"train", "test"}:
-        raise ValueError("source_split must be 'train' or 'test'")
+    if normalized not in {"train", "validation", "test"}:
+        raise ValueError("source_split must be 'train', 'validation', or 'test'")
     return normalized
 
 
@@ -69,15 +69,18 @@ def build_supervised_record(
     prompt_config: PromptConfig = DEFAULT_PROMPT_CONFIG,
     label_config: LabelConfig = DEFAULT_LABEL_CONFIG,
 ) -> dict[str, Any]:
-    """Create one answer-supervised record from the training split only."""
+    """Create one answer-supervised record for training or validation."""
 
     if not isinstance(sample, TrajectorySample):
         raise TypeError("build_supervised_record expects TrajectorySample")
-    if _split_name(source_split) != "train":
-        raise ValueError("supervised records may be generated only from the train split")
+    split = _split_name(source_split)
+    if split not in {"train", "validation"}:
+        raise ValueError(
+            "supervised records may be generated only from train or validation"
+        )
     if sample.future is None:
         raise ValueError("supervised record requires y_future")
-    record = _prompt_fields(sample.observation, "train", road_config, prompt_config)
+    record = _prompt_fields(sample.observation, split, road_config, prompt_config)
     labels = derive_training_labels(sample, label_config)
     answer = format_lc_llm_output(
         labels.notable_features,

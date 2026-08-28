@@ -153,11 +153,28 @@ def load_teacher_vectors(vector_dir: Path) -> tuple[dict[int, np.ndarray], int]:
     vectors_path = vector_dir / "c.npy"
     if not ids_path.exists() or not vectors_path.exists():
         raise FileNotFoundError(f"Expected ids.npy and c.npy under {vector_dir}")
-    ids = np.load(str(ids_path)).astype(np.int32)
+    ids = np.asarray(np.load(str(ids_path)), dtype=np.int64).reshape(-1)
     vectors = np.load(str(vectors_path)).astype(np.float32)
+    if vectors.ndim != 2:
+        raise ValueError(f"Teacher vectors must be a 2D array, got shape={vectors.shape}")
     if len(ids) != vectors.shape[0]:
         raise ValueError(f"Teacher ids/vector mismatch: ids={len(ids)} vectors={vectors.shape[0]}")
+    if len(np.unique(ids)) != len(ids):
+        raise ValueError(f"Teacher IDs must be unique under {vector_dir}")
     return {int(ids[i]): vectors[i] for i in range(len(ids))}, int(vectors.shape[1])
+
+
+def require_vector_coverage(
+    teacher_vectors: dict[int, np.ndarray], sample_count: int, split_name: str
+) -> None:
+    """Require one exact, zero-based teacher-vector ID for every MAT row in use."""
+
+    missing = sorted(set(range(sample_count)) - set(teacher_vectors))
+    if missing:
+        preview = ", ".join(str(value) for value in missing[:10])
+        raise ValueError(
+            f"Missing {split_name} teacher vectors for zero-based MAT indices: {preview}"
+        )
 
 
 class DistillDataset(Dataset):
@@ -183,17 +200,10 @@ class DistillDataset(Dataset):
         return len(self.samples)
 
     def resolve_sample_id(self, idx: int, sample: dict) -> int:
-        raw_sid = sample.get("sample_id", None)
-        candidates = []
-        if raw_sid is not None:
-            sid = scalar_int(raw_sid)
-            candidates.extend([sid, sid - 1, sid + 1])
-        candidates.extend([idx, idx + 1])
-
-        for candidate in candidates:
-            if candidate in self.teacher_vectors:
-                return candidate
-        raise KeyError(f"No teacher vector found for idx={idx}, sample_id={raw_sid}")
+        del sample
+        if idx not in self.teacher_vectors:
+            raise KeyError(f"No teacher vector found for zero-based MAT index {idx}")
+        return idx
 
     def __getitem__(self, idx: int):
         sample = self.samples[idx]
@@ -315,13 +325,17 @@ def limit_samples(samples: list[dict], max_samples: Optional[int]) -> list[dict]
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the CoT-TP MLP StrategyStudent.")
     parser.add_argument("--train-mat", type=Path, required=True)
+    parser.add_argument("--val-mat", type=Path, required=True)
     parser.add_argument("--test-mat", type=Path, required=True)
     parser.add_argument("--train-key", type=str, default="train_data")
+    parser.add_argument("--val-key", type=str, default="validation_data")
     parser.add_argument("--test-key", type=str, default="test_data")
     parser.add_argument("--train-vector-dir", type=Path, required=True)
+    parser.add_argument("--val-vector-dir", type=Path, required=True)
     parser.add_argument("--test-vector-dir", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, default=Path("outputs/student_mlp"))
     parser.add_argument("--max-train-samples", type=int, default=None)
+    parser.add_argument("--max-val-samples", type=int, default=None)
     parser.add_argument("--max-test-samples", type=int, default=None)
     parser.add_argument("--history-len", type=int, default=10)
     parser.add_argument("--hidden-dim", type=int, default=128)
@@ -352,8 +366,57 @@ def resolve_device(device_arg: str) -> torch.device:
     return torch.device(device_arg)
 
 
+@torch.no_grad()
+def evaluate_student(
+    student: nn.Module,
+    data_loader: DataLoader,
+    device: torch.device,
+    mse_loss: nn.Module,
+    lambda_cos: float,
+) -> dict[str, float]:
+    student.eval()
+    total_mse = 0.0
+    total_cos = 0.0
+    total_seen = 0
+
+    for hist_norm, target, _ in data_loader:
+        hist_norm = hist_norm.to(device)
+        target = target.to(device)
+        pred = student(hist_norm)
+        loss_mse = mse_loss(pred, target)
+        cos_sim = F.cosine_similarity(pred, target, dim=1).mean()
+        batch_size = hist_norm.size(0)
+        total_seen += batch_size
+        total_mse += float(loss_mse) * batch_size
+        total_cos += float(cos_sim) * batch_size
+
+    if total_seen == 0:
+        raise ValueError("Evaluation set contains no finite samples")
+
+    mean_mse = total_mse / total_seen
+    mean_cos = total_cos / total_seen
+    return {
+        "mse": mean_mse,
+        "cos": mean_cos,
+        "metric": mean_mse + lambda_cos * (1.0 - mean_cos),
+        "num_samples": total_seen,
+    }
+
+
 def main() -> int:
     args = parse_args()
+    if args.epochs <= 0:
+        raise ValueError("--epochs must be positive")
+    mat_paths = {args.train_mat.resolve(), args.val_mat.resolve(), args.test_mat.resolve()}
+    if len(mat_paths) != 3:
+        raise ValueError("Training, validation, and test MAT paths must be distinct")
+    vector_paths = {
+        args.train_vector_dir.resolve(),
+        args.val_vector_dir.resolve(),
+        args.test_vector_dir.resolve(),
+    }
+    if len(vector_paths) != 3:
+        raise ValueError("Training, validation, and test vector directories must be distinct")
     set_seed(args.seed)
     device = resolve_device(args.device)
     ego_cols, neighbor_cols = build_column_schemas(args)
@@ -365,35 +428,42 @@ def main() -> int:
     best_ckpt_path = args.out_dir / "best_student_mlp.pth"
     strategy_ckpt_path = args.out_dir / "strategy_student_distill.pth"
     metrics_csv = args.out_dir / "epoch_metrics.csv"
+    test_metrics_path = args.out_dir / "test_metrics.json"
+    if test_metrics_path.exists():
+        test_metrics_path.unlink()
 
     train_samples = limit_samples(load_mat_samples(args.train_mat, args.train_key), args.max_train_samples)
-    test_samples = limit_samples(load_mat_samples(args.test_mat, args.test_key), args.max_test_samples)
+    val_samples = limit_samples(load_mat_samples(args.val_mat, args.val_key), args.max_val_samples)
 
     train_vectors, train_dim = load_teacher_vectors(args.train_vector_dir)
-    test_vectors, test_dim = load_teacher_vectors(args.test_vector_dir)
-    if train_dim != test_dim:
-        raise ValueError(f"Teacher-vector dimension mismatch: train={train_dim}, test={test_dim}")
+    val_vectors, val_dim = load_teacher_vectors(args.val_vector_dir)
+    if train_dim != val_dim:
+        raise ValueError(f"Teacher-vector dimension mismatch: train={train_dim}, val={val_dim}")
     vector_dim = train_dim
+    require_vector_coverage(train_vectors, len(train_samples), "training")
+    require_vector_coverage(val_vectors, len(val_samples), "validation")
     hist_dim = args.history_len * 4 * 4
 
     train_raw = DistillDataset(train_samples, train_vectors, vector_dim, args.history_len, ego_cols, neighbor_cols, args.eps)
-    test_raw = DistillDataset(test_samples, test_vectors, vector_dim, args.history_len, ego_cols, neighbor_cols, args.eps)
+    val_raw = DistillDataset(val_samples, val_vectors, vector_dim, args.history_len, ego_cols, neighbor_cols, args.eps)
     good_train, bad_train = finite_indices(train_raw)
-    good_test, bad_test = finite_indices(test_raw)
+    good_val, bad_val = finite_indices(val_raw)
     print(f"[filter] train good={len(good_train)} bad={len(bad_train)}")
     if bad_train:
         print("  train bad examples:", bad_train[:10])
-    print(f"[filter] test good={len(good_test)} bad={len(bad_test)}")
-    if bad_test:
-        print("  test bad examples:", bad_test[:10])
+    print(f"[filter] val good={len(good_val)} bad={len(bad_val)}")
+    if bad_val:
+        print("  val bad examples:", bad_val[:10])
+    if not good_train or not good_val:
+        raise ValueError("Training and validation sets must contain finite samples")
 
     hist_mean, hist_std = compute_hist_mean_std(train_raw, good_train, hist_dim, args.eps)
     np.savez(str(scaler_path), hist_mean=hist_mean.numpy(), hist_std=hist_std.numpy())
 
     train_ds = HistNormWrapper(train_raw, hist_mean, hist_std)
-    test_ds = HistNormWrapper(test_raw, hist_mean, hist_std)
+    val_ds = HistNormWrapper(val_raw, hist_mean, hist_std)
     train_loader = DataLoader(Subset(train_ds, good_train), batch_size=args.batch_size, shuffle=True, drop_last=False)
-    test_loader = DataLoader(Subset(test_ds, good_test), batch_size=args.batch_size, shuffle=False, drop_last=False)
+    val_loader = DataLoader(Subset(val_ds, good_val), batch_size=args.batch_size, shuffle=False, drop_last=False)
 
     student = MLPStrategyStudent(in_dim=hist_dim, hidden_dim=args.hidden_dim, out_dim=vector_dim).to(device)
     optimizer = torch.optim.Adam(student.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -402,14 +472,16 @@ def main() -> int:
     run_config = {
         "student_type": "mlp",
         "train_mat": str(args.train_mat),
+        "val_mat": str(args.val_mat),
         "test_mat": str(args.test_mat),
         "train_vector_dir": str(args.train_vector_dir),
+        "val_vector_dir": str(args.val_vector_dir),
         "test_vector_dir": str(args.test_vector_dir),
         "out_dir": str(args.out_dir),
         "num_train_samples": len(train_samples),
-        "num_test_samples": len(test_samples),
+        "num_val_samples": len(val_samples),
         "good_train": len(good_train),
-        "good_test": len(good_test),
+        "good_val": len(good_val),
         "history_len": args.history_len,
         "hist_dim": hist_dim,
         "strategy_vector_dim": vector_dim,
@@ -419,6 +491,8 @@ def main() -> int:
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "lambda_cos": args.lambda_cos,
+        "selection_split": "validation",
+        "selection_metric": "mse_plus_cosine_loss",
         "seed": args.seed,
         "device": str(device),
         "ego_cols": ego_cols.__dict__,
@@ -459,25 +533,16 @@ def main() -> int:
             train_cos /= train_seen
             train_metric = train_mse + args.lambda_cos * (1.0 - train_cos)
 
-            student.eval()
-            val_mse = 0.0
-            val_cos = 0.0
-            val_seen = 0
-            with torch.no_grad():
-                for hist_norm, target, _ in test_loader:
-                    hist_norm = hist_norm.to(device)
-                    target = target.to(device)
-                    pred = student(hist_norm)
-                    loss_mse = mse_loss(pred, target)
-                    cos_sim = F.cosine_similarity(pred, target, dim=1).mean()
-                    batch_size = hist_norm.size(0)
-                    val_seen += batch_size
-                    val_mse += float(loss_mse) * batch_size
-                    val_cos += float(cos_sim) * batch_size
-
-            val_mse /= val_seen
-            val_cos /= val_seen
-            val_metric = val_mse + args.lambda_cos * (1.0 - val_cos)
+            val_metrics = evaluate_student(
+                student,
+                val_loader,
+                device,
+                mse_loss,
+                args.lambda_cos,
+            )
+            val_mse = val_metrics["mse"]
+            val_cos = val_metrics["cos"]
+            val_metric = val_metrics["metric"]
 
             if val_metric < best_val_metric:
                 best_val_metric = val_metric
@@ -527,10 +592,82 @@ def main() -> int:
                 f"Val MSE={val_mse:.6f} cos={val_cos:.4f} metric={val_metric:.6f}"
             )
 
-    if best_payload is None:
-        write_json(args.out_dir / "best_metrics.json", {"error": "No checkpoint saved"})
+    if best_payload is None or not best_ckpt_path.exists():
+        raise RuntimeError("Training finished without a validation-selected checkpoint")
+
+    checkpoint = torch.load(str(best_ckpt_path), map_location=device, weights_only=False)
+    student.load_state_dict(checkpoint["state_dict"], strict=True)
+
+    print("Loading the test set for one final evaluation")
+    test_samples = limit_samples(load_mat_samples(args.test_mat, args.test_key), args.max_test_samples)
+    test_vectors, test_dim = load_teacher_vectors(args.test_vector_dir)
+    if test_dim != vector_dim:
+        raise ValueError(f"Teacher-vector dimension mismatch: train={vector_dim}, test={test_dim}")
+    require_vector_coverage(test_vectors, len(test_samples), "test")
+
+    test_raw = DistillDataset(
+        test_samples,
+        test_vectors,
+        vector_dim,
+        args.history_len,
+        ego_cols,
+        neighbor_cols,
+        args.eps,
+    )
+    good_test, bad_test = finite_indices(test_raw)
+    print(f"[filter] test good={len(good_test)} bad={len(bad_test)}")
+    if bad_test:
+        print("  test bad examples:", bad_test[:10])
+    if not good_test:
+        raise ValueError("Test set must contain finite samples")
+
+    test_ds = HistNormWrapper(test_raw, hist_mean, hist_std)
+    test_loader = DataLoader(
+        Subset(test_ds, good_test),
+        batch_size=args.batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
+    set_seed(args.seed)
+    test_metrics = evaluate_student(
+        student,
+        test_loader,
+        device,
+        mse_loss,
+        args.lambda_cos,
+    )
+    test_payload = {
+        "checkpoint": str(best_ckpt_path),
+        "selected_epoch": best_payload["best_epoch"],
+        "selection_metric": "validation_mse_plus_cosine_loss",
+        "selection_split": "validation",
+        "evaluation_seed": args.seed,
+        "test_evaluations": 1,
+        "num_test_samples": len(test_samples),
+        "good_test": len(good_test),
+        "bad_test": len(bad_test),
+        "test_mse": test_metrics["mse"],
+        "test_cos": test_metrics["cos"],
+        "test_metric": test_metrics["metric"],
+    }
+    write_json(test_metrics_path, test_payload)
+
+    run_config.update(
+        {
+            "num_test_samples": len(test_samples),
+            "good_test": len(good_test),
+            "bad_test": len(bad_test),
+            "test_evaluations": 1,
+        }
+    )
+    write_json(args.out_dir / "run_config.json", run_config)
 
     print("Student distillation completed.")
+    print(
+        f"Final test | MSE={test_metrics['mse']:.6f} "
+        f"cos={test_metrics['cos']:.4f} metric={test_metrics['metric']:.6f}"
+    )
+    print(f"Final test metrics saved to {test_metrics_path}")
     return 0
 
 

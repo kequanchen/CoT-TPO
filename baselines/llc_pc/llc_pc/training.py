@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from .context_index import QueryResult, TrainContextIndex
 from .intention_points import IntentionPointKMeans
-from .model import LLCPCModelConfig, LLCPCMotionTransformer
+from .model import LLCPCModelConfig, LLCPCMotionTransformer, llc_pc_loss
 from .tensorizer import (
     FeatureStandardizer,
     TensorizedBatch,
@@ -52,8 +52,8 @@ def retrieve_semantic_contexts(
     """Query a frozen training-only context index using observations only."""
 
     normalized_split = str(split).strip().lower()
-    if normalized_split not in {"train", "test"}:
-        raise ValueError("split must be 'train' or 'test'")
+    if normalized_split not in {"train", "validation", "test"}:
+        raise ValueError("split must be 'train', 'validation', or 'test'")
     index_path = Path(config["paths"]["context_index"])
     index = TrainContextIndex.load(index_path)
     standardizer = FeatureStandardizer.load(standardizer_path_for_index(index_path))
@@ -190,6 +190,57 @@ def model_inputs(batch: Mapping[str, Tensor]) -> dict[str, Tensor]:
     }
 
 
+def evaluate_loss_epoch(
+    model: LLCPCMotionTransformer,
+    loader: DataLoader,
+    device: torch.device,
+) -> dict[str, float]:
+    """Evaluate supervised loss without updating model state.
+
+    This helper is intended for the independent validation split during
+    training. Final test ADE/FDE remain the responsibility of ``evaluate.py``.
+    """
+
+    was_training = model.training
+    model.eval()
+    regression_total = 0.0
+    classification_total = 0.0
+    valid_points = 0
+    examples = 0
+    try:
+        with torch.no_grad():
+            for batch in loader:
+                batch = move_batch(batch, device)
+                prediction = model(**model_inputs(batch))
+                losses = llc_pc_loss(
+                    prediction,
+                    batch["future"].float(),
+                    batch["future_valid_mask"].bool(),
+                )
+                count = int(batch["future"].shape[0])
+                point_count = int(batch["future_valid_mask"].bool().sum().item())
+                examples += count
+                valid_points += point_count
+                regression_total += (
+                    float(losses["regression_loss"].detach().cpu()) * point_count
+                )
+                classification_total += (
+                    float(losses["classification_loss"].detach().cpu()) * count
+                )
+    finally:
+        model.train(was_training)
+
+    if examples == 0 or valid_points == 0:
+        raise RuntimeError("no validation batches were processed")
+    regression_loss = regression_total / valid_points
+    classification_loss = classification_total / examples
+    return {
+        "loss": regression_loss + classification_loss,
+        "regression_loss": regression_loss,
+        "classification_loss": classification_loss,
+    }
+
+
 def save_checkpoint(
     path: Path,
     model: LLCPCMotionTransformer,
@@ -197,7 +248,7 @@ def save_checkpoint(
     *,
     epoch: int,
     config: Mapping[str, Any],
-    metrics: Mapping[str, float],
+    metrics: Mapping[str, Any],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(

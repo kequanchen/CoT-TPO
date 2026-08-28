@@ -28,6 +28,8 @@ class SFTRecord:
     system_prompt: str
     user_prompt: str
     answer: str
+    event_id: str | None = None
+    source_split: str | None = None
 
 
 def format_llama2_chat_prompt(system_prompt: str, user_prompt: str) -> str:
@@ -60,7 +62,20 @@ def record_from_mapping(record: Mapping[str, Any], *, require_answer: bool = Tru
         answer = raw_answer.strip()
     else:
         raise TypeError("answer must be a string when provided")
-    return SFTRecord(sample_id, system_prompt, user_prompt, answer)
+    event_id = _optional_nonempty_text(record.get("event_id"), "event_id")
+    source_split = _optional_nonempty_text(record.get("source_split"), "source_split")
+    if source_split is not None:
+        source_split = source_split.lower()
+        if source_split not in {"train", "validation", "test"}:
+            raise ValueError("source_split must be 'train', 'validation', or 'test'")
+    return SFTRecord(
+        sample_id=sample_id,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        answer=answer,
+        event_id=event_id,
+        source_split=source_split,
+    )
 
 
 def load_jsonl_records(
@@ -68,14 +83,23 @@ def load_jsonl_records(
     *,
     require_answer: bool = True,
     max_records: int | None = None,
+    expected_source_split: str | None = None,
+    require_event_id: bool = False,
 ) -> list[SFTRecord]:
-    """Load validated records while rejecting duplicate sample identifiers."""
+    """Load validated records while rejecting duplicate or misassigned examples."""
 
     source = Path(path).expanduser().resolve()
     if not source.is_file():
         raise FileNotFoundError(f"LC-LLM JSONL file not found: {source}")
     if max_records is not None and max_records <= 0:
         raise ValueError("max_records must be positive")
+    expected_split = None
+    if expected_source_split is not None:
+        expected_split = str(expected_source_split).strip().lower()
+        if expected_split not in {"train", "validation", "test"}:
+            raise ValueError(
+                "expected_source_split must be 'train', 'validation', or 'test'"
+            )
     records: list[SFTRecord] = []
     seen: set[str] = set()
     with source.open("r", encoding="utf-8") as handle:
@@ -89,6 +113,13 @@ def load_jsonl_records(
                 raise ValueError(f"invalid record at {source}:{line_number}: {exc}") from exc
             if record.sample_id in seen:
                 raise ValueError(f"duplicate sample_id at {source}:{line_number}: {record.sample_id}")
+            if expected_split is not None and record.source_split != expected_split:
+                raise ValueError(
+                    f"source_split at {source}:{line_number} is {record.source_split!r}; "
+                    f"expected {expected_split!r}"
+                )
+            if require_event_id and record.event_id is None:
+                raise ValueError(f"event_id is required at {source}:{line_number}")
             seen.add(record.sample_id)
             records.append(record)
             if max_records is not None and len(records) >= max_records:
@@ -262,3 +293,9 @@ def _nonempty_text(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} must be a non-empty string")
     return value.strip()
+
+
+def _optional_nonempty_text(value: Any, field: str) -> str | None:
+    if value is None:
+        return None
+    return _nonempty_text(value, field)

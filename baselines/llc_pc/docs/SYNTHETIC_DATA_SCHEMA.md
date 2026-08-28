@@ -6,9 +6,10 @@ expected by the adapter.
 
 ## MATLAB Container
 
-The training and test files each contain a configurable top-level struct array.
-The example configuration uses `train_data` and `test_data`. Each element is one
-trajectory sample with the following fields:
+The training, validation, and test files each contain a configurable top-level
+struct array. The example configuration uses `train_data`, `validation_data`,
+and `test_data`. Each element is one trajectory sample with the following
+fields:
 
 | Field | Shape | Description |
 | --- | --- | --- |
@@ -17,7 +18,7 @@ trajectory sample with the following fields:
 | `lane_status` | scalar | Lane-change status supplied by preprocessing. |
 | `time_since_crossing` | scalar | Time metadata supplied by preprocessing. |
 | `x_hist` | `(T, 6)` | Observed ego history. |
-| `y_future` | `(H, 2)` | Future ego coordinates used only for supervised training and evaluation. |
+| `y_future` | `(H, 2)` | Future ego coordinates used for training, validation selection, and final test evaluation. |
 | `ctx` | struct | Ego and neighboring-vehicle histories. |
 
 The paper-aligned defaults are `T = 10` at 10 Hz and `H = 50` for the maximum
@@ -122,8 +123,10 @@ inference inputs. It may be used only for:
 
 - fitting intention-point clusters on the training split;
 - calculating the supervised trajectory loss on the training split; and
-- calculating reported metrics after prediction.
+- calculating validation loss for checkpoint selection; and
+- calculating reported test metrics after the checkpoint has been selected.
 
 The context database and intention-point clusters must be fitted from training
-samples only. Test samples may query the frozen training context database but
-must never be inserted into it.
+samples only. Validation and test samples may query the frozen training context
+database but must never be inserted into it. The three splits must be formed at
+the event level before overlapping trajectory windows are extracted.
